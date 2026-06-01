@@ -1,7 +1,8 @@
 # VPS Hardening Suite — Design & Implementation Plan
 
-Status: **Phases 1–2 implemented** — container guard + per-step backout +
-`install_admin_key()` are in `vps-lockdown.sh`; remaining phases (§6) still planned.
+Status: **Phases 1–3 implemented** — container guard + per-step backout +
+`install_admin_key()` + optional `bitwarden_backup()` are in `vps-lockdown.sh`;
+remaining phases (§6) still planned.
 Target script: `vps-lockdown.sh` (+ `vps-audit.sh` as the verification companion)
 Branch: `claude/ssh-key-hardening-bitwarden-QqjuH`
 
@@ -234,7 +235,17 @@ shippable. Nothing here is dropped; later phases are simply later.
 > target user's `authorized_keys` (append + dedupe, perms 600 / `.ssh` 700).
 > When a key is supplied, `add_user()` skips its blind copy of root's
 > `authorized_keys`; with no key supplied, that copy-from-root fallback is kept.
-> Phases 3–7 remain planned.
+>
+> **Phase 3** adds `bitwarden_backup()` (called after `restart_sshd`): an opt-in,
+> non-fatal backup of all `/etc/ssh/ssh_host_*` files to Bitwarden. It detects
+> `bw`/`jq` (skips cleanly if absent), resolves a session from `BW_SESSION` or
+> `bw unlock --raw` (never logging secrets), then creates a secure-note item
+> named `vps-harden/<hostname>` in a `vps-harden` folder and attaches every host
+> key — deleting any existing same-named item first so re-runs don't duplicate.
+> If anything is missing or fails, hardening still succeeds. **Note:** the
+> vault-interaction paths could not be executed in CI (no `bw`); only the
+> declined / `bw`-absent skip paths and syntax were validated — they need a
+> one-time check on a host with `bw` installed. Phases 4–7 remain planned.
 
 1. **Phase 1 — Per-step backout foundation (§7.1) + container guard.** A
    `change_record` + per-step `trap`-revert helper so every subsequent mutating

@@ -1475,6 +1475,117 @@ function restart_sshd() {
     fi
 }
 
+##############################
+## Bitwarden Host-Key Backup ##
+##############################
+
+function bitwarden_backup() {
+    # Phase 3: OPTIONAL backup of this server's SSH HOST keys to Bitwarden.
+    # Entirely opt-in and NON-FATAL: if declined, or bw/jq are missing, or any
+    # call fails, hardening still succeeds. Runs after restart_sshd so it can
+    # never interfere with restoring SSH access. Bitwarden is never required.
+    echo -e -n "${lightcyan}"
+    figlet Bitwarden | tee -a "$LOGFILE"
+    echo -e -n "${lightcyan}"
+    echo -e " OPTIONAL: back up this server's SSH HOST keys (/etc/ssh/ssh_host_*)"
+    echo -e " to Bitwarden so a rebuilt server can keep its host identity."
+    echo -e -n "${yellow}"
+    echo -e " NOTE: host keys are sensitive - anyone who obtains them can impersonate"
+    echo -e " this server. Only do this if your Bitwarden vault is trusted.\n"
+    echo -e -n "${cyan}"
+
+    local DOBW=""
+    while :; do
+        read -n 1 -s -r -p " Back up SSH host keys to Bitwarden now? y/n  " DOBW
+        [[ ${DOBW,,} == "y" || ${DOBW,,} == "n" ]] && break
+    done
+    echo -e "${nocolor}\n"
+    if [ "${DOBW,,}" != "y" ]; then
+        echo -e -n "${yellow}"
+        echo -e " --> User declined Bitwarden host-key backup; skipping." | tee -a "$LOGFILE"
+        echo -e -n "${nocolor}"
+        return 0
+    fi
+
+    # Soft dependencies - detect, never auto-install.
+    if ! command -v bw >/dev/null 2>&1; then
+        echo -e " --> Bitwarden CLI (bw) not found; skipping host-key backup." | tee -a "$LOGFILE"
+        return 0
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo -e " --> jq not found; skipping host-key backup." | tee -a "$LOGFILE"
+        return 0
+    fi
+
+    # Resolve a session without writing secrets to the log. Prefer BW_SESSION;
+    # otherwise unlock interactively (master password prompt goes to the tty).
+    set +x
+    local sess="${BW_SESSION:-}"
+    if [ -z "$sess" ]; then
+        echo -e " Unlocking Bitwarden vault..."
+        sess="$(bw unlock --raw 2>>"$LOGFILE")" || true
+    fi
+    if [ -z "$sess" ]; then
+        echo -e " --> No Bitwarden session available; skipping host-key backup." | tee -a "$LOGFILE"
+        return 0
+    fi
+
+    if ! bw sync --session "$sess" >/dev/null 2>>"$LOGFILE"; then
+        echo -e " --> bw sync failed; skipping host-key backup." | tee -a "$LOGFILE"
+        unset sess
+        return 0
+    fi
+
+    local host mid itemname folderid notes
+    host="$(hostname)"
+    mid="$(cat /etc/machine-id 2>/dev/null || echo unknown)"
+    itemname="vps-harden/$host"
+
+    # Find or create the 'vps-harden' folder.
+    folderid="$(bw list folders --session "$sess" 2>>"$LOGFILE" | jq -r '.[] | select(.name=="vps-harden") | .id' | head -n1)"
+    if [ -z "$folderid" ] || [ "$folderid" = "null" ]; then
+        folderid="$(bw get template folder | jq '.name="vps-harden"' | bw encode | bw create folder --session "$sess" 2>>"$LOGFILE" | jq -r '.id')"
+    fi
+
+    # Update-if-exists: delete any existing items with this exact name so a re-run
+    # never litters the vault with duplicates or stale attachments.
+    local id
+    for id in $(bw list items --search "$itemname" --session "$sess" 2>>"$LOGFILE" | jq -r --arg n "$itemname" '.[] | select(.name==$n) | .id'); do
+        bw delete item "$id" --session "$sess" >/dev/null 2>>"$LOGFILE" || true
+    done
+
+    # Create a secure-note item and attach every present host-key file.
+    notes="SSH host key backup for ${host} (machine-id ${mid}). Created by vps-lockdown on $(date)."
+    local itemid
+    itemid="$(bw get template item \
+        | jq --arg n "$itemname" --arg notes "$notes" --arg f "$folderid" \
+            '.type=2 | .secureNote.type=0 | .name=$n | .notes=$notes | (if $f=="" or $f=="null" then . else .folderId=$f end)' \
+        | bw encode | bw create item --session "$sess" 2>>"$LOGFILE" | jq -r '.id')"
+    if [ -z "$itemid" ] || [ "$itemid" = "null" ]; then
+        echo -e " --> Could not create Bitwarden item; skipping host-key backup." | tee -a "$LOGFILE"
+        unset sess
+        return 0
+    fi
+
+    local f count=0
+    for f in /etc/ssh/ssh_host_*; do
+        [ -e "$f" ] || continue
+        if bw create attachment --file "$f" --itemid "$itemid" --session "$sess" >/dev/null 2>>"$LOGFILE"; then
+            count=$((count+1))
+        else
+            echo -e " --> Failed to attach $f" | tee -a "$LOGFILE"
+        fi
+    done
+    bw sync --session "$sess" >/dev/null 2>>"$LOGFILE" || true
+    unset sess BW_SESSION
+
+    echo -e -n "${lightgreen}"
+    echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
+    echo -e " $(date +%m.%d.%Y_%H:%M:%S) : SUCCESS : backed up $count host-key file(s) to Bitwarden item '$itemname'" | tee -a "$LOGFILE"
+    echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
+    echo -e -n "${nocolor}"
+}
+
 ######################
 ## Install Complete ##
 ######################
@@ -1565,6 +1676,7 @@ google_auth
 ksplice_install
 motd_install
 restart_sshd
+bitwarden_backup
 install_complete
 
 exit
