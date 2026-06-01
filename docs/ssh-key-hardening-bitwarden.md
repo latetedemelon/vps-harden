@@ -1,14 +1,26 @@
-# SSH Key Hardening + Bitwarden Backup — Design & Implementation Plan
+# VPS Hardening Suite — Design & Implementation Plan
 
 Status: **Proposal for review** (no script changes made yet)
-Target script: `get-hard.sh`
+Target script: `get-hard.sh` (+ `vps-audit.sh` as the verification companion)
 Branch: `claude/ssh-key-hardening-bitwarden-QqjuH`
 
-This document proposes how to add optional **Bitwarden-backed SSH key handling**
-to `vps-harden` without destabilising the existing interactive flow. It is a plan
-only — the actual `get-hard.sh` functions are described, not yet written, so we
-can agree the approach (and especially the security model) before touching the
-script.
+This document started as a plan for **Bitwarden-backed SSH key handling** and has,
+per review, grown into the agreed scope for a best-of-breed hardening suite. **All
+of the following are now in scope** (sequenced, not dropped):
+
+1. Bitwarden-backed SSH key handling (§1–§5) — the original pillar.
+2. **Backout / rollback** as a first-class feature, so any change can be undone
+   and a failed step self-heals (§7.1).
+3. **Read-only audit** integration via `vps-audit.sh` — a "harden, then verify"
+   loop, with a dry-run/audit mode (§7.2).
+4. **Non-interactive automation** (CLI flags + Secrets Manager) for unattended
+   fleets (§7.3).
+5. **Cross-distro + LXC awareness and CIS-depth hardening** as later phases
+   (§7.4), drawn from the best-of-breed review (§9).
+
+It remains a plan only — functions are described, not yet written, so we can agree
+the approach (especially the security model and the rollback contract) before
+touching the script.
 
 ---
 
@@ -150,9 +162,9 @@ are absent in the installed CLI.
 
 For fully unattended fleets, **Bitwarden Secrets Manager** (machine accounts +
 scoped access tokens) is a better fit than an interactive `bw` vault session.
-This plan keeps the first version on the personal `bw` CLI (matches the script's
-interactive nature); a Secrets Manager path can be a later follow-up and is
-called out in §7.
+The interactive `bw` CLI is the default path (matches the script's interactive
+nature); the Secrets Manager machine-account path is now in scope as the
+unattended-automation profile (§7.3).
 
 ---
 
@@ -173,32 +185,89 @@ called out in §7.
 
 ---
 
-## 6. Phased implementation
+## 6. Phased implementation (delivery order — all phases in scope)
 
-1. **Phase 1 — `install_admin_key()` (public key only).** Smallest, safest win;
-   validates and installs a supplied pubkey. No Bitwarden dependency.
-2. **Phase 2 — `bitwarden_backup()` host-key backup**, Pattern A with Pattern B
+Phases are a *sequencing* of the agreed scope, each independently reviewable and
+shippable. Nothing here is dropped; later phases are simply later.
+
+1. **Phase 1 — Backout foundation (§7.1).** A `change_record` + `revert` helper
+   so every subsequent mutating step is backed up and reversible. Built first
+   because everything else depends on it for safety.
+2. **Phase 2 — `install_admin_key()` (public key only).** Validate and install a
+   supplied pubkey. No Bitwarden dependency.
+3. **Phase 3 — `bitwarden_backup()` host-key backup**, Pattern A with Pattern B
    fallback, all preconditions detected, fully non-fatal.
-3. **Phase 3 — docs.** Update `README.md` with a short "Bitwarden host-key
-   backup (optional)" section and prerequisites.
-4. **Phase 4 (optional, later)** — Secrets Manager machine-account path for
-   unattended fleets; LXC/non-Ubuntu awareness (see §7).
-
-Each phase is independently reviewable and shippable.
+4. **Phase 4 — Audit integration (§7.2).** Wire `vps-audit.sh` as a post-harden
+   verification gate; add a `--audit`/read-only dry-run mode.
+5. **Phase 5 — Non-interactive automation (§7.3).** CLI flags (`--admin-key`,
+   `--ssh-port`, `--yes`, `--rollback`) and a Secrets Manager profile.
+6. **Phase 6 — Cross-distro + LXC + CIS depth (§7.4).** Distro/service
+   abstraction, LXC detection, and the deeper konstruktoid-style controls.
+7. **Phase 7 — docs.** Update `README.md` for each capability as it lands.
 
 ---
 
-## 7. Out of scope for the first version (explicitly deferred)
+## 7. Now in full scope (was previously deferred)
 
-- **Local bootstrap script** that generates the admin key and stores the
-  *private* key in Bitwarden on the operator's trusted machine. Valuable, but a
-  separate deliverable from the on-server hardening script.
-- **Distro/LXC profiles.** `get-hard.sh` is Ubuntu/`apt`-only today. Host-key
-  backup itself is distro-agnostic, but firewall/sysctl/auditd hardening is not.
-  A future refactor could split profiles (`debian-ubuntu`, `rhel-fedora`,
-  `alpine`, `lxc-limited`, `vm-full`); for LXC specifically, sysctl/firewall/
-  AppArmor are often host-managed and should be skipped on the guest.
-- **Bitwarden Secrets Manager** integration (see §4.3).
+### 7.1 Backout / rollback (first-class)
+
+Every change the script makes must be **recorded and reversible**. Adopt the
+pratiktri pattern (timestamped backups + revert functions) and generalise it:
+
+- A `change_record <path>` helper copies any file to
+  `<path>.vps-harden.<timestamp>.bak` **before** first modification, and appends
+  the original path to a manifest at `/var/backups/vps-harden/<run-id>/manifest`.
+- For non-file changes (package installs, `ufw enable`, service state) record an
+  inverse action in the same manifest (e.g. `ufw disable`, `apt remove`).
+- A `--rollback [run-id]` mode replays the manifest in reverse: restore files
+  from `.bak`, run inverse actions, then `sshd -t` and reload. Defaults to the
+  most recent run.
+- Each step runs under a `trap` so a mid-step failure triggers an automatic
+  revert of *that* step and a clear prompt, instead of leaving a half-applied
+  change. This is the safety net that makes aggressive SSH/firewall changes safe.
+- Extends — not replaces — the existing `sshd_config` backup (`get-hard.sh:464`).
+
+### 7.2 Read-only audit integration
+
+`vps-audit.sh` already performs 53 PASS/WARN/FAIL checks and changes nothing —
+keep it exactly as a read-only tool and wire it into the workflow:
+
+- **Post-harden gate:** after `get-hard.sh` finishes (and after rollback), run
+  `vps-audit.sh` and surface the summary, so the operator sees independent
+  confirmation that root login/password auth/port/firewall/updates landed.
+- **Dry-run / `--audit` mode in `get-hard.sh`:** a read-only pass that reports
+  what *would* change without writing anything — mirrors the audit tool's
+  philosophy and lets operators preview before committing.
+- **Machine-readable output (cross-repo, `vps-audit`):** add a `--json` (and
+  meaningful exit code) mode to `vps-audit.sh` so the harden script — or CI — can
+  consume results programmatically and fail a run if a critical check regresses.
+  This is a small companion change planned on the `vps-audit` repo's matching
+  branch.
+
+### 7.3 Non-interactive automation
+
+- **CLI flags** (pratiktri-style): `--admin-key`, `--ssh-port`, `--user`,
+  `--yes`, `--audit`, `--rollback` so the same script serves guided *and*
+  unattended runs. Interactive prompts remain the default when flags are absent.
+- **Bitwarden Secrets Manager** profile (machine account + scoped access token)
+  for fleet automation, selected when a token is present instead of an
+  interactive `bw` session (§4.3).
+- **Local bootstrap script** (operator's trusted machine): generate the admin
+  ed25519 key, store the **private** key in Bitwarden locally, and pass only the
+  **public** key to `get-hard.sh` — the safe inverse of pratiktri's on-server
+  key generation (§2, §9).
+
+### 7.4 Cross-distro, LXC awareness, and CIS-depth hardening
+
+- **Distro/service abstraction** (pratiktri): detect `apt`/`dnf`/`zypper`/
+  `pacman` and systemd/sysvinit so the suite runs beyond Ubuntu. Split into
+  profiles: `debian-ubuntu`, `rhel-fedora`, `alpine`, `lxc-limited`, `vm-full`.
+- **LXC/LXD detection** (konstruktoid): on containers, skip controls that belong
+  on the host (sysctl, firewall, AppArmor) instead of failing.
+- **CIS-depth controls** (konstruktoid), added incrementally and each gated +
+  reversible via §7.1: auditd, AppArmor enforce, sysctl hardening, AIDE, usbguard,
+  kernel module/filesystem disabling, PAM/umask, no-exec mounts. Each is
+  validated by the audit gate (§7.2).
 
 ---
 
@@ -212,6 +281,16 @@ Each phase is independently reviewable and shippable.
   vault to a fresh box and confirm the host key fingerprint matches.
 - Confirm declining every new prompt yields byte-for-byte the same outcome as the
   current script (no behavioural regression).
+- **Backout (§7.1):** after a full run, `--rollback` restores files from the
+  manifest, reverses inverse actions, and `vps-audit.sh` afterward shows the box
+  back at its pre-harden baseline. Also force a mid-step failure and confirm the
+  `trap` auto-reverts just that step, leaving SSH reachable.
+- **Audit gate (§7.2):** `vps-audit.sh` run after hardening reports the expected
+  PASS results; `--audit` dry-run mode writes nothing (verify with no file mtime
+  changes); `--json` output parses and returns a non-zero exit on a seeded
+  critical regression.
+- **Non-interactive (§7.3):** a fully flag-driven run (`--admin-key … --ssh-port
+  … --yes`) completes with no prompts and matches the interactive result.
 
 ---
 
@@ -236,7 +315,7 @@ strongest ideas from each rather than reinvent them.
 - **From konstruktoid:** config-file-driven + modular sourcing for *idempotency*;
   the deep-hardening backlog (auditd, AppArmor, sysctl, AIDE, usbguard, kernel
   module/filesystem disabling, PAM/umask); and **LXC/LXD detection** — which
-  directly validates the LXC-profile deferral in §7.
+  directly validates the LXC-profile work now in scope at §7.4.
 - **From pratiktri:** **non-interactive CLI flags** (essential for unattended/
   Bitwarden automation), the **multi-distro service/package abstraction**, and
   **timestamped backups paired with revert functions** so a failed step rolls
@@ -254,23 +333,25 @@ strongest ideas from each rather than reinvent them.
   `vps-audit.sh` after hardening to confirm SSH root/password/port and firewall
   land as intended. "Harden, then audit" closes the loop.
 
-### Resulting recommendation
+### Resulting recommendation (all of this is now in scope)
 
-Keep `get-hard.sh`'s approachable interactive flow as the base, and layer in,
-incrementally:
+Keep `get-hard.sh`'s approachable interactive flow as the base, and build out the
+full suite in the delivery order of §6:
 
-1. **A non-interactive flag path** (pratiktri-style: `--admin-key`, `--ssh-port`,
-   `--yes`) so the same script supports unattended runs — a prerequisite for any
-   automated Bitwarden host-key backup.
-2. **Backup-with-revert** around each mutating step (pratiktri), extending the
-   existing `sshd_config` backup, so a bad step self-heals instead of locking the
-   operator out.
-3. **The Bitwarden + admin-pubkey work in §3–§6**, unchanged — the comparison
-   reinforces, rather than alters, its security model.
-4. **Deep-hardening + cross-distro/LXC as later phases** (konstruktoid/pratiktri),
-   still deferred per §7, with `vps-audit.sh` as the verification gate.
+1. **Backout/rollback first** (§7.1, pratiktri) — every mutating step backed up
+   and reversible, extending the existing `sshd_config` backup, so a bad step
+   self-heals instead of locking the operator out.
+2. **Bitwarden + admin-pubkey work** (§3–§6) — security model unchanged; the
+   comparison reinforced it.
+3. **Read-only audit as the verification gate** (§7.2, vps-audit) — "harden, then
+   audit," plus a `--audit` dry-run and a `--json` mode on `vps-audit.sh`.
+4. **Non-interactive automation** (§7.3, pratiktri) — CLI flags + Secrets Manager
+   for unattended runs, plus the local-bootstrap key-generation script.
+5. **Cross-distro/LXC + CIS depth** (§7.4, konstruktoid/pratiktri), each control
+   gated and reversible and validated by the audit gate.
 
-This keeps v1 small and safe while giving a clear, evidence-backed roadmap.
+Sequenced so each phase ships and is reviewable on its own, with safety
+(backout + audit) landing before the aggressive changes that need it.
 
 ## 10. Open questions for review
 
@@ -284,7 +365,11 @@ This keeps v1 small and safe while giving a clear, evidence-backed roadmap.
    create a new one?
 4. **Secrets Manager**: is unattended fleet use a near-term requirement, or is the
    interactive `bw` CLI sufficient for v1?
-5. **Best-of-breed sequencing (§9):** for v1, do we want the non-interactive flag
-   path and backup-with-revert in scope alongside the Bitwarden work, or kept as a
-   fast-follow? And is cross-distro/CIS depth (konstruktoid/pratiktri) a near-term
-   goal or explicitly a v2 roadmap item?
+5. **Rollback granularity (§7.1):** is per-step auto-revert-on-failure enough, or
+   do you also want a full `--rollback` that returns the box to its pre-harden
+   state in one command? (Plan currently includes both.)
+6. **Audit coupling (§7.2):** should a failing `vps-audit.sh` critical check make
+   a hardening run exit non-zero (CI-style gate), or only warn? And do you want
+   the `--json` mode added to `vps-audit` in the same PR series or its own?
+7. **Distro priority (§7.4):** after Ubuntu/Debian, which distro family next —
+   RHEL/Fedora or Alpine — and is LXC support needed early or late?
