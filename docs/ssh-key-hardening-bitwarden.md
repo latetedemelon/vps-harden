@@ -1,6 +1,6 @@
 # VPS Hardening Suite — Design & Implementation Plan
 
-Status: **Proposal for review** (no script changes made yet)
+Status: **Proposal for review** (script renamed to `vps-lockdown.sh`; no logic changes yet)
 Target script: `vps-lockdown.sh` (+ `vps-audit.sh` as the verification companion)
 Branch: `claude/ssh-key-hardening-bitwarden-QqjuH`
 
@@ -21,6 +21,28 @@ of the following are now in scope** (sequenced, not dropped):
 It remains a plan only — functions are described, not yet written, so we can agree
 the approach (especially the security model and the rollback contract) before
 touching the script.
+
+---
+
+## 0. Core principle: Bitwarden is optional
+
+**`vps-lockdown.sh` must fully harden a server with no Bitwarden present.** This is
+a hard requirement, not a nicety:
+
+- The core flow (user, SSH config, firewall, updates, fail2ban, sysctl, backout,
+  audit) depends on **no** Bitwarden component — no `bw` CLI, no `jq`, no vault,
+  no session, no Secrets Manager token.
+- Bitwarden adds exactly one optional capability: **host-key backup** (§4), plus a
+  later optional Secrets Manager path for unattended automation (§7.3).
+- If `bw`/`jq` is missing, or the vault is locked, or any Bitwarden call fails, the
+  function **logs, skips, and continues** — the run still succeeds and exits 0 for
+  reasons unrelated to Bitwarden. Bitwarden is never on the critical path and never
+  a gate.
+- `jq` and `bw` are therefore **soft dependencies**, checked only inside the
+  Bitwarden function (`command -v`), never required at startup.
+
+Everything below treats Bitwarden as a bolt-on to an already-complete hardening
+tool.
 
 ---
 
@@ -94,7 +116,7 @@ does not restructure the script.
 
 | Function | Inserted after | Responsibility |
 |---|---|---|
-| `install_admin_key()` (optional) | `add_user` | If an admin public key is supplied (env `AUTHORIZED_KEY` or prompt), validate it with `ssh-keygen -l -f` and write it to the admin user's `authorized_keys` with correct perms. Public key only. |
+| `install_admin_key()` (optional) | `add_user` | If an admin public key is supplied (`--admin-key`/`AUTHORIZED_KEY`/prompt), validate it with `ssh-keygen -l -f`, then **append it (deduped) to the admin user's `authorized_keys`** with correct perms and **skip the blind copy of root's keys**. Public key only. When no key is supplied, fall back to today's copy-from-root behaviour. |
 | `bitwarden_backup()` | `restart_sshd` (i.e. after sshd is confirmed healthy) | Opt-in. If `bw` CLI + session are available, back up `/etc/ssh/ssh_host_*` to Bitwarden. Always non-fatal. |
 
 `bitwarden_backup` runs **late** (after `restart_sshd`) so a Bitwarden hiccup can
@@ -155,8 +177,15 @@ for f in /etc/ssh/ssh_host_*; do
 done
 ```
 
-The implementation will **try A, fall back to B** if the SSH-key template fields
-are absent in the installed CLI.
+Both patterns **iterate every present `ssh_host_*` pair** (ed25519, rsa, ecdsa) —
+backing up only a subset would still trigger "host key changed" warnings for
+clients pinned to an omitted type. The implementation will **try A, fall back to
+B** if the SSH-key template fields are absent in the installed CLI.
+
+**Item naming & dedupe:** items go in a dedicated **`vps-harden`** folder, named
+**`vps-harden/<hostname>`**, and are **updated in place if they already exist**
+(matched on `hostname + /etc/machine-id`) so re-running hardening never litters the
+vault with duplicates.
 
 ### 4.3 Note on unattended automation
 
@@ -190,10 +219,12 @@ unattended-automation profile (§7.3).
 Phases are a *sequencing* of the agreed scope, each independently reviewable and
 shippable. Nothing here is dropped; later phases are simply later.
 
-1. **Phase 1 — Per-step backout foundation (§7.1).** A `change_record` + per-step
-   `trap`-revert helper so every subsequent mutating step is backed up and
-   auto-reverts itself on failure. Built first because everything else depends on
-   it for safety.
+1. **Phase 1 — Per-step backout foundation (§7.1) + container guard.** A
+   `change_record` + per-step `trap`-revert helper so every subsequent mutating
+   step is backed up and auto-reverts on failure, **plus an `is_container()` guard
+   that auto-skips host-managed steps on LXC** (swap, sysctl, firewall enable,
+   `tmpfs` fstab, ksplice). Built first because everything else depends on both for
+   safety and for running on LXC as well as VMs.
 2. **Phase 2 — `install_admin_key()` (public key only).** Validate and install a
    supplied pubkey. No Bitwarden dependency.
 3. **Phase 3 — `bitwarden_backup()` host-key backup**, Pattern A with Pattern B
@@ -372,6 +403,10 @@ Sequenced so each phase ships and is reviewable on its own, with safety
 ## 10. Decisions locked & remaining open questions
 
 ### Locked by review
+- **Bitwarden is optional (hard requirement):** the suite must fully harden a box
+  **with no Bitwarden present** — no `bw`/`jq`, no vault, no token. Bitwarden only
+  adds host-key backup (and, later, Secrets Manager automation); if it is absent
+  or fails, every other step still runs and the run still succeeds. See §0.
 - **Naming:** the hardening script is **`vps-lockdown.sh`**; `vps-audit` is its
   read-only, non-destructive sibling. Repo stays `vps-harden`.
 - **Rollback (§7.1):** **per-step** auto-revert-on-failure is the contract; no
@@ -379,17 +414,30 @@ Sequenced so each phase ships and is reviewable on its own, with safety
 - **Audit gate (§7.2):** a failing **critical** `vps-audit` check **blocks
   roll-forward** (exit non-zero) unless `--ignore-audit-failures` is passed.
 - **Distro priority (§7.4):** **Debian family → Red Hat family → Alpine.**
+- **Container support (§7.4, pulled into Phase 1):** a lightweight `is_container()`
+  guard (via `systemd-detect-virt --container` / `/run/systemd/container` /
+  cgroup) lands in Phase 1 and **auto-skips host-managed steps on LXC** — swap,
+  `sysctl`, firewall enable, `tmpfs` fstab, and ksplice — so `vps-lockdown.sh`
+  runs safely on both VMs and LXC guests immediately, with full per-distro
+  profiles still arriving in Phase 6.
+- **`install_admin_key` placement (§3):** when an admin public key is supplied
+  (`--admin-key`/`AUTHORIZED_KEY`), **install it to the admin user (append +
+  dedupe) and skip the blind copy of root's `authorized_keys`**; validate with
+  `ssh-keygen -l -f` first. Fall back to today's copy-from-root only when no key
+  is supplied.
+- **Host keys to back up (§4):** **all present `ssh_host_*` pairs** (ed25519, rsa,
+  ecdsa), private + public — partial backup would still trigger "host key changed"
+  for clients pinned to an omitted type.
+- **Bitwarden item naming/dedupe (§4):** dedicated folder **`vps-harden`**, item
+  name **`vps-harden/<hostname>`**, **update-if-exists** keyed on
+  `hostname + /etc/machine-id` so re-runs don't litter the vault.
+- **`vps-audit --json` sequencing (§7.2):** a **separate PR on the `vps-audit`
+  branch, landed first** — isolated, read-only, and a dependency of the audit gate
+  (Phase 4); Phases 1–3 don't need it.
 
 ### Still open
-1. **Default placement of `install_admin_key`** — keep `add_user`'s existing
-   "copy root's authorized_keys" behaviour, or have the new function supersede it
-   when `AUTHORIZED_KEY` is supplied?
-2. **Which host keys** — back up all `ssh_host_*` or only the modern
-   `ed25519`/`rsa` pairs?
-3. **Item naming / folder / collection** convention in Bitwarden (e.g.
-   `vps-harden/<hostname>`), and should we update an existing item or always
-   create a new one?
-4. **`vps-audit` `--json` PR sequencing** — add the machine-readable/exit-code
-   mode in this PR series or a separate one on the `vps-audit` branch?
-5. **Critical-vs-warn classification** — which of the 53 `vps-audit` checks count
-   as *critical* (block roll-forward) vs warn-only?
+1. **Critical-vs-warn classification (§7.2)** — needs one deliberate pass to tag
+   all 53 `vps-audit` checks. Proposed starter *critical* set (blocks
+   roll-forward): SSH root login ≠ `no`; password auth enabled when key-only was
+   chosen; firewall inactive or SSH port not allowed; no sudo-capable admin user;
+   fail2ban not running. Everything else stays *warn*. **Confirm the critical set.**
