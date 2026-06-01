@@ -215,7 +215,64 @@ Each phase is independently reviewable and shippable.
 
 ---
 
-## 9. Open questions for review
+## 9. Best-of-breed synthesis (4 reference scripts)
+
+Per review feedback, the approach was re-evaluated against four existing
+hardening scripts plus the audit companion in this org. The goal is to take the
+strongest ideas from each rather than reinvent them.
+
+### Scripts reviewed
+
+| # | Script | Style | Distro scope | Notable strengths | Notable gaps |
+|---|---|---|---|---|---|
+| 1 | **`vps-harden/get-hard.sh`** (this repo, akcryptoguy) | Interactive, monolithic | Ubuntu only | Friendly guided flow; swap; Google Authenticator 2FA; ksplice; MOTD; backs up `sshd_config`; logs to `/var/log/server_hardening.log` | Ubuntu-only; one long file; copies root's `authorized_keys`; no key validation; no rollback |
+| 2 | **`AMega/VPS-Server-Hardening`** (cited ancestor) | Interactive, simple | Ubuntu only | Clear minimal baseline (user, SSH port, UFW, MOTD) | fail2ban only half-implemented; least complete; largely superseded by #1 |
+| 3 | **`konstruktoid/hardening`** (`ubuntu.sh`) | Modular, config-driven, idempotent | Ubuntu LTS | CIS-grade depth: auditd, AppArmor enforce, AIDE+timer, rkhunter, usbguard, sysctl, disabled kernel modules/filesystems, SUID/umask/PAM limits, no-exec mounts; UFW with admin-IP allowlist + SSH group restriction; **LXC/LXD detection**; sources `scripts/*` with a `.cfg` | Heavyweight; opinionated; not interactive/newbie-oriented |
+| 4 | **`pratiktri/server_init_harden`** (`init-linux-harden.sh`) | POSIX, non-interactive CLI | Debian/Ubuntu/RHEL/Fedora/SUSE/Arch/**FreeBSD** | Cross-distro via service/pkg abstraction; CLI flags (`-u`, `-r`); timestamped backups **with revert functions**; `sshd -t` validation before restart; fail2ban `recidive` jail + ignores server's own IP | **Generates the SSH keypair on the server and echoes the private key to the console and log file before deleting it** — the exact anti-pattern this design rejects (see §2) |
+| — | **`vps-audit/vps-audit.sh`** (companion, ex-vernu) | Read-only, 53 PASS/WARN/FAIL checks | Linux | Independent verification of SSH/root/password/port/firewall/updates; handles `Include` override dirs | Audits, does not change anything (by design) |
+
+### What to adopt from each
+
+- **From konstruktoid:** config-file-driven + modular sourcing for *idempotency*;
+  the deep-hardening backlog (auditd, AppArmor, sysctl, AIDE, usbguard, kernel
+  module/filesystem disabling, PAM/umask); and **LXC/LXD detection** — which
+  directly validates the LXC-profile deferral in §7.
+- **From pratiktri:** **non-interactive CLI flags** (essential for unattended/
+  Bitwarden automation), the **multi-distro service/package abstraction**, and
+  **timestamped backups paired with revert functions** so a failed step rolls
+  back. Its `sshd -t`-before-restart is the right safety gate (#1 already does a
+  variant). Its fail2ban `recidive` + ignore-own-IP jail is a cheap win.
+- **From pratiktri (as a cautionary tale):** its private-key handling is exactly
+  why §2 forbids the script from ever generating or emitting an admin *private*
+  key, and why §5 forbids writing key material to `$LOGFILE`. This is the single
+  most important "do the opposite of this" lesson of the comparison.
+- **From `get-hard.sh` (keep):** the guided interactive UX, swap setup, optional
+  2FA, MOTD, and `sshd_config` backup — these make it approachable for newcomers,
+  which is this project's audience.
+- **From AMega:** nothing net-new; it is the minimal ancestor of #1.
+- **From vps-audit:** treat its 53 checks as **acceptance criteria** — run
+  `vps-audit.sh` after hardening to confirm SSH root/password/port and firewall
+  land as intended. "Harden, then audit" closes the loop.
+
+### Resulting recommendation
+
+Keep `get-hard.sh`'s approachable interactive flow as the base, and layer in,
+incrementally:
+
+1. **A non-interactive flag path** (pratiktri-style: `--admin-key`, `--ssh-port`,
+   `--yes`) so the same script supports unattended runs — a prerequisite for any
+   automated Bitwarden host-key backup.
+2. **Backup-with-revert** around each mutating step (pratiktri), extending the
+   existing `sshd_config` backup, so a bad step self-heals instead of locking the
+   operator out.
+3. **The Bitwarden + admin-pubkey work in §3–§6**, unchanged — the comparison
+   reinforces, rather than alters, its security model.
+4. **Deep-hardening + cross-distro/LXC as later phases** (konstruktoid/pratiktri),
+   still deferred per §7, with `vps-audit.sh` as the verification gate.
+
+This keeps v1 small and safe while giving a clear, evidence-backed roadmap.
+
+## 10. Open questions for review
 
 1. **Default placement of `install_admin_key`** — keep `add_user`'s existing
    "copy root's authorized_keys" behaviour, or have the new function supersede it
@@ -227,3 +284,7 @@ Each phase is independently reviewable and shippable.
    create a new one?
 4. **Secrets Manager**: is unattended fleet use a near-term requirement, or is the
    interactive `bw` CLI sufficient for v1?
+5. **Best-of-breed sequencing (§9):** for v1, do we want the non-interactive flag
+   path and backup-with-revert in scope alongside the Bitwarden work, or kept as a
+   fast-follow? And is cross-distro/CIS depth (konstruktoid/pratiktri) a near-term
+   goal or explicitly a v2 roadmap item?
