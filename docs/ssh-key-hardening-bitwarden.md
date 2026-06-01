@@ -1,6 +1,7 @@
 # VPS Hardening Suite — Design & Implementation Plan
 
-Status: **Proposal for review** (script renamed to `vps-lockdown.sh`; no logic changes yet)
+Status: **Phase 1 implemented** — container guard + per-step backout are in
+`vps-lockdown.sh`; remaining phases (§6) still planned.
 Target script: `vps-lockdown.sh` (+ `vps-audit.sh` as the verification companion)
 Branch: `claude/ssh-key-hardening-bitwarden-QqjuH`
 
@@ -218,6 +219,14 @@ unattended-automation profile (§7.3).
 
 Phases are a *sequencing* of the agreed scope, each independently reviewable and
 shippable. Nothing here is dropped; later phases are simply later.
+
+> **Status:** Phase 1 is implemented. `vps-lockdown.sh` now detects containers
+> (`detect_container`/`skip_in_container`) and auto-skips swap, sysctl, the
+> `tmpfs` fstab entry, UFW, and ksplice on LXC/Docker; and a per-step backout
+> library (`init_backout`, `step_begin`, `change_record`, `record_inverse`,
+> `step_revert`, `step_commit`) writes a manifest under
+> `/var/backups/vps-harden/<run-id>/` and auto-reverts a failed step (wired into
+> swap, server-hardening, and SSH-config changes). Phases 2–7 remain planned.
 
 1. **Phase 1 — Per-step backout foundation (§7.1) + container guard.** A
    `change_record` + per-step `trap`-revert helper so every subsequent mutating

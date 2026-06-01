@@ -113,6 +113,129 @@ function begin_log() {
     sleep 2
 }
 
+############################################
+## BACKOUT & CONTAINER DETECTION (Phase 1) ##
+############################################
+# Foundation that everything else builds on:
+#  - Container awareness: host-managed steps (swap, sysctl, firewall, ksplice)
+#    are skipped inside LXC/Docker where they are blocked or meaningless, so the
+#    script runs safely on both VMs and containers.
+#  - Per-step backout: every mutating step records what it touches; if that step
+#    fails it reverts ONLY itself, leaving SSH and the rest of the system intact.
+#    A manifest is written for auditability and manual recovery.
+
+# Detect once whether we are running inside a container.
+function detect_container() {
+    IS_CONTAINER="no"
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        systemd-detect-virt --container --quiet && IS_CONTAINER="yes"
+    fi
+    if [ "$IS_CONTAINER" = "no" ]; then
+        if [ -f /run/systemd/container ] || [ -f /.dockerenv ]; then
+            IS_CONTAINER="yes"
+        elif grep -qaE '(lxc|docker|containerd|kubepods)' /proc/1/cgroup 2>/dev/null; then
+            IS_CONTAINER="yes"
+        elif [ -n "${container:-}" ]; then
+            IS_CONTAINER="yes"
+        fi
+    fi
+    if [ "$IS_CONTAINER" = "yes" ]; then
+        echo -e -n "${yellow}"
+        echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
+        echo -e " $(date +%m.%d.%Y_%H:%M:%S) : Container detected (LXC/Docker)" | tee -a "$LOGFILE"
+        echo -e " Host-managed steps (swap, sysctl, firewall, ksplice) will be skipped." | tee -a "$LOGFILE"
+        echo -e "---------------------------------------------------- \n" | tee -a "$LOGFILE"
+        echo -e -n "${nocolor}"
+        sleep 1
+    fi
+}
+
+# Return 0 (and log) when a host-managed step should be skipped in a container.
+function skip_in_container() {
+    local label="$1"
+    if [ "${IS_CONTAINER:-no}" = "yes" ]; then
+        echo -e -n "${yellow}"
+        echo -e " --> Skipping '$label' inside container (host-managed). " | tee -a "$LOGFILE"
+        echo -e -n "${nocolor}"
+        return 0
+    fi
+    return 1
+}
+
+# Initialise the per-run backout manifest.
+function init_backout() {
+    BACKUP_ROOT="/var/backups/vps-harden"
+    RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
+    RUN_DIR="$BACKUP_ROOT/$RUN_ID"
+    MANIFEST="$RUN_DIR/manifest"
+    mkdir -p "$RUN_DIR"
+    chmod 700 "$BACKUP_ROOT" "$RUN_DIR" 2>/dev/null
+    : > "$MANIFEST"
+    echo "# vps-lockdown backout manifest - run $RUN_ID - $(date)" >> "$MANIFEST"
+    echo -e -n "${white}"
+    echo -e " $(date +%m.%d.%Y_%H:%M:%S) : Backout manifest at $MANIFEST" | tee -a "$LOGFILE"
+    echo -e -n "${nocolor}"
+}
+
+# Begin a named, individually-revertable step.
+function step_begin() {
+    CURRENT_STEP="$1"
+    STEP_BACKUPS=()
+    STEP_INVERSES=()
+    echo "STEP $CURRENT_STEP $(date +%s)" >> "$MANIFEST"
+}
+
+# Back up a file before it is modified (records ABSENT if it does not yet exist).
+function change_record() {
+    local path="$1" stamp safe backup
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    safe="$(echo "$path" | sed 's#/#_#g')"
+    backup="$RUN_DIR/${safe}.${stamp}.bak"
+    if [ -e "$path" ]; then
+        cp -a "$path" "$backup"
+        STEP_BACKUPS+=("$path|$backup")
+        echo "FILE $path $backup" >> "$MANIFEST"
+    else
+        STEP_BACKUPS+=("$path|")   # empty backup => file was absent; revert deletes it
+        echo "ABSENT $path" >> "$MANIFEST"
+    fi
+}
+
+# Record an inverse command to undo a non-file change (e.g. 'ufw disable').
+function record_inverse() {
+    STEP_INVERSES+=("$*")
+    echo "CMD $*" >> "$MANIFEST"
+}
+
+# Revert ONLY the current step: undo inverse commands, then restore/delete files.
+function step_revert() {
+    echo -e -n "${lightred}"
+    echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
+    echo -e " $(date +%m.%d.%Y_%H:%M:%S) : Step '$CURRENT_STEP' failed - reverting this step only" | tee -a "$LOGFILE"
+    echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
+    echo -e -n "${nocolor}"
+    local i entry path backup
+    for (( i=${#STEP_INVERSES[@]}-1; i>=0; i-- )); do
+        eval "${STEP_INVERSES[$i]}" >> "$LOGFILE" 2>&1 || true
+    done
+    for (( i=${#STEP_BACKUPS[@]}-1; i>=0; i-- )); do
+        entry="${STEP_BACKUPS[$i]}"
+        path="${entry%%|*}"
+        backup="${entry#*|}"
+        if [ -n "$backup" ] && [ -e "$backup" ]; then
+            cp -a "$backup" "$path"
+        elif [ -z "$backup" ]; then
+            rm -f "$path"
+        fi
+    done
+    echo "REVERTED $CURRENT_STEP $(date +%s)" >> "$MANIFEST"
+}
+
+# Mark the current step as successfully committed.
+function step_commit() {
+    echo "COMMIT $CURRENT_STEP $(date +%s)" >> "$MANIFEST"
+}
+
 #########################
 ## CHECK & CREATE SWAP ##
 #########################
@@ -126,6 +249,9 @@ function create_swap() {
     echo -e " $(date +%m.%d.%Y_%H:%M:%S) : CHECK FOR AND CREATE SWAP " | tee -a "$LOGFILE"
     echo -e "------------------------------------------------- \n" | tee -a "$LOGFILE"
     echo -e -n "${white}"
+
+    # Swap is host-managed inside containers (swapon is blocked) - skip there.
+    if skip_in_container "swap creation"; then return; fi
 
     # Check for swap file - if none, create one
     if free | awk '/^Swap:/ {exit !$2}'; then
@@ -142,14 +268,26 @@ function create_swap() {
         (($SWAPSIZE >= 1 && $SWAPSIZE >= 31)) && SWAPSIZE=31
         (($SWAPSIZE <= 2)) && SWAPSIZE=2
 
-        fallocate -l ${SWAPSIZE}G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && cp /etc/fstab /etc/fstab.bak && echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
-        echo -e -n "${lightgreen}"
-        echo -e "-------------------------------------------------- " | tee -a "$LOGFILE"
-        echo -e " $(date +%m.%d.%Y_%H:%M:%S) : SWAP CREATED SUCCESSFULLY " | tee -a "$LOGFILE"
-        echo -e "--> Thanks @Cryptotron for supplying swap code <-- "
-        echo -e "-------------------------------------------------- \n" | tee -a "$LOGFILE"
-        sleep 2
-        echo -e -n "${nocolor}"
+        step_begin "create_swap"
+        change_record /etc/fstab
+        if fallocate -l ${SWAPSIZE}G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile; then
+            record_inverse "swapoff /swapfile 2>/dev/null; rm -f /swapfile"
+            cp /etc/fstab /etc/fstab.bak && echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
+            step_commit
+            echo -e -n "${lightgreen}"
+            echo -e "-------------------------------------------------- " | tee -a "$LOGFILE"
+            echo -e " $(date +%m.%d.%Y_%H:%M:%S) : SWAP CREATED SUCCESSFULLY " | tee -a "$LOGFILE"
+            echo -e "--> Thanks @Cryptotron for supplying swap code <-- "
+            echo -e "-------------------------------------------------- \n" | tee -a "$LOGFILE"
+            sleep 2
+            echo -e -n "${nocolor}"
+        else
+            step_revert
+            echo -e -n "${lightred}"
+            echo -e " $(date +%m.%d.%Y_%H:%M:%S) : Swap creation failed - skipped, no changes kept" | tee -a "$LOGFILE"
+            echo -e -n "${nocolor}"
+            sleep 2
+        fi
     fi
 }
 
@@ -459,7 +597,9 @@ function collect_sshd() {
             echo -e -n "${nocolor}"
         fi
     done
-    # Take a backup of the existing config
+    # Take a backup of the existing config (also record it in the backout manifest)
+    step_begin "ssh_config"
+    change_record "$SSHDFILE"
     BTIME=$(date +%F_%R)
     cat $SSHDFILE > $SSHDFILE."$BTIME".bak
     echo -e "\n"
@@ -495,6 +635,7 @@ function collect_sshd() {
 
     # Set SSHPORTIS to the final value of the SSH port
     SSHPORTIS=$(sed -n -e '/^Port /p' $SSHDFILE)
+    step_commit
 }
 
 function prompt_rootlogin {
@@ -708,7 +849,10 @@ function ufw_config() {
         done
         echo -e "${nocolor}\n"
     
-    if [ "${FIREWALLP,,}" = "Y" ] || [ "${FIREWALLP,,}" = "y" ]
+    if { [ "${FIREWALLP,,}" = "Y" ] || [ "${FIREWALLP,,}" = "y" ]; } && skip_in_container "firewall (UFW) configuration"; then
+        # netfilter is host-managed in containers; ensure restart_sshd won't try to enable UFW
+        FIREWALLP="n"
+    elif [ "${FIREWALLP,,}" = "Y" ] || [ "${FIREWALLP,,}" = "y" ]
     then	echo -e -n "${nocolor}"
         # make sure ufw is installed #
         apt-get install ufw -qqy >> $LOGFILE 2>&1
@@ -774,6 +918,7 @@ function server_hardening() {
     # check if GETHARD is valid
     if [ "${GETHARD,,}" = "Y" ] || [ "${GETHARD,,}" = "y" ]
     then
+        step_begin "server_hardening"
 
         # secure shared memory
         echo -e -n "${yellow}"
@@ -785,9 +930,13 @@ function server_hardening() {
         echo -e ' tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0' | tee -a "$LOGFILE"
         echo -e "---------------------------------------------------- \n" | tee -a "$LOGFILE"
         sleep 2	; #  dramatic pause
+        # /run/shm and fstab mounts are host-managed inside containers - skip there
+        if skip_in_container "shared memory hardening"; then :
         # only add line if line does not already exist in /etc/fstab
-        if grep -q "tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0" /etc/fstab; then :
-        else echo 'tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0' >> /etc/fstab
+        elif grep -q "tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0" /etc/fstab; then :
+        else
+            change_record /etc/fstab
+            echo 'tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0' >> /etc/fstab
         fi
 
         # enable DDOS protection
@@ -799,7 +948,12 @@ function server_hardening() {
         echo -e " Replace /etc/ufw/before.rules with hardened rules " | tee -a "$LOGFILE"
         echo -e "---------------------------------------------------- \n " | tee -a "$LOGFILE"
         sleep 2	; #  dramatic pause
-        cat etc/ufw/before.rules > /etc/ufw/before.rules
+        # netfilter/UFW rules are host-managed inside containers - skip there
+        if skip_in_container "UFW DDOS before.rules"; then :
+        else
+            change_record /etc/ufw/before.rules
+            cat etc/ufw/before.rules > /etc/ufw/before.rules
+        fi
 
         # harden the networking layer
         echo -e -n "${yellow}"
@@ -810,7 +964,12 @@ function server_hardening() {
         echo -e " --> Secure /etc/sysctl.conf with hardening rules " | tee -a "$LOGFILE"
         echo -e "---------------------------------------------------- \n " | tee -a "$LOGFILE"
         sleep 2	; #  dramatic pause
-        cat etc/sysctl.conf > /etc/sysctl.conf
+        # kernel sysctl is largely read-only/namespaced inside containers - skip there
+        if skip_in_container "sysctl network hardening"; then :
+        else
+            change_record /etc/sysctl.conf
+            cat etc/sysctl.conf > /etc/sysctl.conf
+        fi
 
         # enable automatic security updates
         echo -e -n "${yellow}"
@@ -823,13 +982,19 @@ function server_hardening() {
         sleep 2	; #  dramatic pause
 
         . /etc/os-release
-        if [[ "${VERSION_ID}" = "16.04" ]] 
-        then cat etc/apt/apt.conf.d/10periodic > /etc/apt/apt.conf.d/10periodic
-        else cat etc/apt/apt.conf.d/20auto-upgrades > /etc/apt/apt.conf.d/20auto-upgrades
+        if [[ "${VERSION_ID}" = "16.04" ]]
+        then
+            change_record /etc/apt/apt.conf.d/10periodic
+            cat etc/apt/apt.conf.d/10periodic > /etc/apt/apt.conf.d/10periodic
+        else
+            change_record /etc/apt/apt.conf.d/20auto-upgrades
+            cat etc/apt/apt.conf.d/20auto-upgrades > /etc/apt/apt.conf.d/20auto-upgrades
         fi
 
+        change_record /etc/apt/apt.conf.d/50unattended-upgrades
         cat etc/apt/apt.conf.d/50unattended-upgrades > /etc/apt/apt.conf.d/50unattended-upgrades
         # consider editing the above 50-unattended-upgrades to automatically reboot when necessary
+        step_commit
 
         # Error Handling
         if [ $? -eq 0 ]
@@ -953,6 +1118,9 @@ function google_auth() {
 #####################
 
 function ksplice_install() {
+
+    # Ksplice live-patches the kernel; containers share the host kernel - skip there
+    if skip_in_container "Ksplice kernel live-patching"; then return; fi
 
     # This KSplice install script only works for Ubuntu 16.04 at the moment
     if [[ -r /etc/os-release ]]; then
@@ -1284,6 +1452,8 @@ check_distro
 setup_environment
 display_banner
 begin_log
+init_backout
+detect_container
 create_swap
 update_upgrade
 favored_packages
