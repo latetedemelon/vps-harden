@@ -1,7 +1,7 @@
 # VPS Hardening Suite — Design & Implementation Plan
 
 Status: **Proposal for review** (no script changes made yet)
-Target script: `get-hard.sh` (+ `vps-audit.sh` as the verification companion)
+Target script: `vps-lockdown.sh` (+ `vps-audit.sh` as the verification companion)
 Branch: `claude/ssh-key-hardening-bitwarden-QqjuH`
 
 This document started as a plan for **Bitwarden-backed SSH key handling** and has,
@@ -65,9 +65,9 @@ when the operator explicitly opts in.
 
 ---
 
-## 3. How this fits the current `get-hard.sh`
+## 3. How this fits the current `vps-lockdown.sh`
 
-`get-hard.sh` is a single, linear, interactive Bash script. Functions are
+`vps-lockdown.sh` is a single, linear, interactive Bash script. Functions are
 defined top-to-bottom and invoked in a fixed order at the end of the file:
 
 ```
@@ -80,9 +80,9 @@ google_auth → ksplice_install → motd_install → restart_sshd → install_co
 Relevant existing behaviour:
 
 - `add_user()` already copies `/root/.ssh/authorized_keys` to the new sudo user
-  if present (`get-hard.sh:399`).
-- `disable_passauth()` already offers to require key-only login (`get-hard.sh:582`).
-- `$SSHDFILE` is `/etc/ssh/sshd_config` (`get-hard.sh:86`).
+  if present (`vps-lockdown.sh:399`).
+- `disable_passauth()` already offers to require key-only login (`vps-lockdown.sh:582`).
+- `$SSHDFILE` is `/etc/ssh/sshd_config` (`vps-lockdown.sh:86`).
 - Logging convention: `... | tee -a "$LOGFILE"` with a timestamped prefix.
 - Script is currently **Ubuntu-only** (16.04/18.04/20.04 per README) and uses
   `apt`, `ufw`, `fail2ban`.
@@ -190,78 +190,94 @@ unattended-automation profile (§7.3).
 Phases are a *sequencing* of the agreed scope, each independently reviewable and
 shippable. Nothing here is dropped; later phases are simply later.
 
-1. **Phase 1 — Backout foundation (§7.1).** A `change_record` + `revert` helper
-   so every subsequent mutating step is backed up and reversible. Built first
-   because everything else depends on it for safety.
+1. **Phase 1 — Per-step backout foundation (§7.1).** A `change_record` + per-step
+   `trap`-revert helper so every subsequent mutating step is backed up and
+   auto-reverts itself on failure. Built first because everything else depends on
+   it for safety.
 2. **Phase 2 — `install_admin_key()` (public key only).** Validate and install a
    supplied pubkey. No Bitwarden dependency.
 3. **Phase 3 — `bitwarden_backup()` host-key backup**, Pattern A with Pattern B
    fallback, all preconditions detected, fully non-fatal.
-4. **Phase 4 — Audit integration (§7.2).** Wire `vps-audit.sh` as a post-harden
-   verification gate; add a `--audit`/read-only dry-run mode.
+4. **Phase 4 — Audit gate (§7.2).** Wire read-only `vps-audit.sh` between
+   steps/phases; a failing **critical** check **blocks roll-forward** (exit
+   non-zero) unless `--ignore-audit-failures` is passed. Add a `--audit` dry-run
+   mode to `vps-lockdown.sh`.
 5. **Phase 5 — Non-interactive automation (§7.3).** CLI flags (`--admin-key`,
-   `--ssh-port`, `--yes`, `--rollback`) and a Secrets Manager profile.
+   `--ssh-port`, `--yes`, `--audit`, `--ignore-audit-failures`) and a Secrets
+   Manager profile.
 6. **Phase 6 — Cross-distro + LXC + CIS depth (§7.4).** Distro/service
-   abstraction, LXC detection, and the deeper konstruktoid-style controls.
+   abstraction in priority order **Debian family → Red Hat family → Alpine**, LXC
+   detection, and the deeper konstruktoid-style controls.
 7. **Phase 7 — docs.** Update `README.md` for each capability as it lands.
 
 ---
 
 ## 7. Now in full scope (was previously deferred)
 
-### 7.1 Backout / rollback (first-class)
+### 7.1 Backout / rollback — per-step (first-class)
 
-Every change the script makes must be **recorded and reversible**. Adopt the
-pratiktri pattern (timestamped backups + revert functions) and generalise it:
+**Decision: rollback is per-step, not whole-run.** Each mutating step is
+self-contained and reverts itself on failure; the script never tries to "undo the
+entire run" as a single operation. Adopt the pratiktri pattern (timestamped
+backups + revert functions) at step granularity:
 
 - A `change_record <path>` helper copies any file to
-  `<path>.vps-harden.<timestamp>.bak` **before** first modification, and appends
-  the original path to a manifest at `/var/backups/vps-harden/<run-id>/manifest`.
-- For non-file changes (package installs, `ufw enable`, service state) record an
-  inverse action in the same manifest (e.g. `ufw disable`, `apt remove`).
-- A `--rollback [run-id]` mode replays the manifest in reverse: restore files
-  from `.bak`, run inverse actions, then `sshd -t` and reload. Defaults to the
-  most recent run.
-- Each step runs under a `trap` so a mid-step failure triggers an automatic
-  revert of *that* step and a clear prompt, instead of leaving a half-applied
-  change. This is the safety net that makes aggressive SSH/firewall changes safe.
-- Extends — not replaces — the existing `sshd_config` backup (`get-hard.sh:464`).
+  `<path>.vps-harden.<timestamp>.bak` **before** that step modifies it, and for
+  non-file changes (package installs, `ufw enable`, service state) records the
+  matching inverse action (e.g. `ufw disable`, `apt remove`).
+- **Each step runs under its own `trap`**: if the step fails, **only that step
+  auto-reverts** — restoring its `.bak` / running its inverse, then `sshd -t` and
+  reload where SSH is involved — and the run stops cleanly with SSH intact. No
+  half-applied change is left behind. This is the contract.
+- A manifest at `/var/backups/vps-harden/<run-id>/manifest` is still written, but
+  **for auditability and manual recovery**, not as an automatic full-run replay.
+- This is the safety net that makes the aggressive SSH/firewall/CIS changes in
+  §7.4 safe to apply.
+- Extends — not replaces — the existing `sshd_config` backup (`vps-lockdown.sh:464`).
 
-### 7.2 Read-only audit integration
+### 7.2 Read-only audit — the non-destructive sibling + roll-forward gate
 
-`vps-audit.sh` already performs 53 PASS/WARN/FAIL checks and changes nothing —
-keep it exactly as a read-only tool and wire it into the workflow:
+`vps-audit` is the **non-destructive version of the suite**: `vps-audit.sh`
+already performs 53 PASS/WARN/FAIL checks and changes nothing. It stays strictly
+read-only — the "what would / did change" tool — and becomes the gate that
+governs whether `vps-lockdown` is allowed to proceed:
 
-- **Post-harden gate:** after `get-hard.sh` finishes (and after rollback), run
-  `vps-audit.sh` and surface the summary, so the operator sees independent
-  confirmation that root login/password auth/port/firewall/updates landed.
-- **Dry-run / `--audit` mode in `get-hard.sh`:** a read-only pass that reports
-  what *would* change without writing anything — mirrors the audit tool's
-  philosophy and lets operators preview before committing.
-- **Machine-readable output (cross-repo, `vps-audit`):** add a `--json` (and
-  meaningful exit code) mode to `vps-audit.sh` so the harden script — or CI — can
-  consume results programmatically and fail a run if a critical check regresses.
-  This is a small companion change planned on the `vps-audit` repo's matching
-  branch.
+- **Critical check blocks roll-forward.** Between steps/phases, `vps-lockdown`
+  runs the read-only audit; **if a _critical_ check fails, the run halts and does
+  not roll forward** to the next step, exiting non-zero. It only proceeds past a
+  failed critical check when explicitly overridden with `--ignore-audit-failures`
+  (alias `--force-forward`). Non-critical findings warn and continue.
+- **Which checks are "critical"** (vs warn-only) is defined in `vps-audit` so the
+  classification lives with the audit tool, not the hardening script.
+- **Dry-run / `--audit` mode in `vps-lockdown.sh`:** a read-only pass that reports
+  what *would* change without writing anything — mirrors `vps-audit`'s philosophy
+  and lets operators preview before committing.
+- **Machine-readable output (cross-repo, `vps-audit`):** add a `--json` + a
+  meaningful **exit code** mode to `vps-audit.sh` so `vps-lockdown` (and CI) can
+  consume results programmatically to implement the gate above. Small companion
+  change on the `vps-audit` repo's matching branch; the tool stays read-only.
 
 ### 7.3 Non-interactive automation
 
 - **CLI flags** (pratiktri-style): `--admin-key`, `--ssh-port`, `--user`,
-  `--yes`, `--audit`, `--rollback` so the same script serves guided *and*
-  unattended runs. Interactive prompts remain the default when flags are absent.
+  `--yes`, `--audit`, `--ignore-audit-failures` so the same script serves guided
+  *and* unattended runs. Interactive prompts remain the default when flags are
+  absent. (No `--rollback` command — rollback is per-step and automatic, §7.1.)
 - **Bitwarden Secrets Manager** profile (machine account + scoped access token)
   for fleet automation, selected when a token is present instead of an
   interactive `bw` session (§4.3).
 - **Local bootstrap script** (operator's trusted machine): generate the admin
   ed25519 key, store the **private** key in Bitwarden locally, and pass only the
-  **public** key to `get-hard.sh` — the safe inverse of pratiktri's on-server
+  **public** key to `vps-lockdown.sh` — the safe inverse of pratiktri's on-server
   key generation (§2, §9).
 
 ### 7.4 Cross-distro, LXC awareness, and CIS-depth hardening
 
 - **Distro/service abstraction** (pratiktri): detect `apt`/`dnf`/`zypper`/
-  `pacman` and systemd/sysvinit so the suite runs beyond Ubuntu. Split into
-  profiles: `debian-ubuntu`, `rhel-fedora`, `alpine`, `lxc-limited`, `vm-full`.
+  `pacman` and systemd/sysvinit so the suite runs beyond Ubuntu. **Priority order:
+  Debian family first → Red Hat family next → Alpine last.** Split into profiles
+  `debian-ubuntu`, `rhel-fedora`, `alpine`, plus the cross-cutting `lxc-limited`
+  and `vm-full`.
 - **LXC/LXD detection** (konstruktoid): on containers, skip controls that belong
   on the host (sysctl, firewall, AppArmor) instead of failing.
 - **CIS-depth controls** (konstruktoid), added incrementally and each gated +
@@ -281,14 +297,14 @@ keep it exactly as a read-only tool and wire it into the workflow:
   vault to a fresh box and confirm the host key fingerprint matches.
 - Confirm declining every new prompt yields byte-for-byte the same outcome as the
   current script (no behavioural regression).
-- **Backout (§7.1):** after a full run, `--rollback` restores files from the
-  manifest, reverses inverse actions, and `vps-audit.sh` afterward shows the box
-  back at its pre-harden baseline. Also force a mid-step failure and confirm the
-  `trap` auto-reverts just that step, leaving SSH reachable.
-- **Audit gate (§7.2):** `vps-audit.sh` run after hardening reports the expected
-  PASS results; `--audit` dry-run mode writes nothing (verify with no file mtime
-  changes); `--json` output parses and returns a non-zero exit on a seeded
-  critical regression.
+- **Backout (§7.1, per-step):** force a mid-step failure and confirm the step's
+  `trap` auto-reverts **just that step** (file restored from `.bak` / inverse
+  action run), the run stops cleanly, SSH stays reachable, and the manifest
+  records what happened. Confirm no half-applied change remains.
+- **Audit gate (§7.2):** seed a critical regression and confirm `vps-lockdown`
+  **halts and exits non-zero** (no roll-forward), then that `--ignore-audit-failures`
+  lets it proceed. `--audit` dry-run writes nothing (verify via unchanged file
+  mtimes); `vps-audit.sh --json` parses and its exit code reflects critical fails.
 - **Non-interactive (§7.3):** a fully flag-driven run (`--admin-key … --ssh-port
   … --yes`) completes with no prompts and matches the interactive result.
 
@@ -304,7 +320,7 @@ strongest ideas from each rather than reinvent them.
 
 | # | Script | Style | Distro scope | Notable strengths | Notable gaps |
 |---|---|---|---|---|---|
-| 1 | **`vps-harden/get-hard.sh`** (this repo, akcryptoguy) | Interactive, monolithic | Ubuntu only | Friendly guided flow; swap; Google Authenticator 2FA; ksplice; MOTD; backs up `sshd_config`; logs to `/var/log/server_hardening.log` | Ubuntu-only; one long file; copies root's `authorized_keys`; no key validation; no rollback |
+| 1 | **`vps-harden/vps-lockdown.sh`** (this repo, akcryptoguy) | Interactive, monolithic | Ubuntu only | Friendly guided flow; swap; Google Authenticator 2FA; ksplice; MOTD; backs up `sshd_config`; logs to `/var/log/server_hardening.log` | Ubuntu-only; one long file; copies root's `authorized_keys`; no key validation; no rollback |
 | 2 | **`AMega/VPS-Server-Hardening`** (cited ancestor) | Interactive, simple | Ubuntu only | Clear minimal baseline (user, SSH port, UFW, MOTD) | fail2ban only half-implemented; least complete; largely superseded by #1 |
 | 3 | **`konstruktoid/hardening`** (`ubuntu.sh`) | Modular, config-driven, idempotent | Ubuntu LTS | CIS-grade depth: auditd, AppArmor enforce, AIDE+timer, rkhunter, usbguard, sysctl, disabled kernel modules/filesystems, SUID/umask/PAM limits, no-exec mounts; UFW with admin-IP allowlist + SSH group restriction; **LXC/LXD detection**; sources `scripts/*` with a `.cfg` | Heavyweight; opinionated; not interactive/newbie-oriented |
 | 4 | **`pratiktri/server_init_harden`** (`init-linux-harden.sh`) | POSIX, non-interactive CLI | Debian/Ubuntu/RHEL/Fedora/SUSE/Arch/**FreeBSD** | Cross-distro via service/pkg abstraction; CLI flags (`-u`, `-r`); timestamped backups **with revert functions**; `sshd -t` validation before restart; fail2ban `recidive` jail + ignores server's own IP | **Generates the SSH keypair on the server and echoes the private key to the console and log file before deleting it** — the exact anti-pattern this design rejects (see §2) |
@@ -325,7 +341,7 @@ strongest ideas from each rather than reinvent them.
   why §2 forbids the script from ever generating or emitting an admin *private*
   key, and why §5 forbids writing key material to `$LOGFILE`. This is the single
   most important "do the opposite of this" lesson of the comparison.
-- **From `get-hard.sh` (keep):** the guided interactive UX, swap setup, optional
+- **From `vps-lockdown.sh` (keep):** the guided interactive UX, swap setup, optional
   2FA, MOTD, and `sshd_config` backup — these make it approachable for newcomers,
   which is this project's audience.
 - **From AMega:** nothing net-new; it is the minimal ancestor of #1.
@@ -335,7 +351,7 @@ strongest ideas from each rather than reinvent them.
 
 ### Resulting recommendation (all of this is now in scope)
 
-Keep `get-hard.sh`'s approachable interactive flow as the base, and build out the
+Keep `vps-lockdown.sh`'s approachable interactive flow as the base, and build out the
 full suite in the delivery order of §6:
 
 1. **Backout/rollback first** (§7.1, pratiktri) — every mutating step backed up
@@ -353,8 +369,18 @@ full suite in the delivery order of §6:
 Sequenced so each phase ships and is reviewable on its own, with safety
 (backout + audit) landing before the aggressive changes that need it.
 
-## 10. Open questions for review
+## 10. Decisions locked & remaining open questions
 
+### Locked by review
+- **Naming:** the hardening script is **`vps-lockdown.sh`**; `vps-audit` is its
+  read-only, non-destructive sibling. Repo stays `vps-harden`.
+- **Rollback (§7.1):** **per-step** auto-revert-on-failure is the contract; no
+  whole-run `--rollback` command (manifest kept for audit/manual recovery only).
+- **Audit gate (§7.2):** a failing **critical** `vps-audit` check **blocks
+  roll-forward** (exit non-zero) unless `--ignore-audit-failures` is passed.
+- **Distro priority (§7.4):** **Debian family → Red Hat family → Alpine.**
+
+### Still open
 1. **Default placement of `install_admin_key`** — keep `add_user`'s existing
    "copy root's authorized_keys" behaviour, or have the new function supersede it
    when `AUTHORIZED_KEY` is supplied?
@@ -363,13 +389,7 @@ Sequenced so each phase ships and is reviewable on its own, with safety
 3. **Item naming / folder / collection** convention in Bitwarden (e.g.
    `vps-harden/<hostname>`), and should we update an existing item or always
    create a new one?
-4. **Secrets Manager**: is unattended fleet use a near-term requirement, or is the
-   interactive `bw` CLI sufficient for v1?
-5. **Rollback granularity (§7.1):** is per-step auto-revert-on-failure enough, or
-   do you also want a full `--rollback` that returns the box to its pre-harden
-   state in one command? (Plan currently includes both.)
-6. **Audit coupling (§7.2):** should a failing `vps-audit.sh` critical check make
-   a hardening run exit non-zero (CI-style gate), or only warn? And do you want
-   the `--json` mode added to `vps-audit` in the same PR series or its own?
-7. **Distro priority (§7.4):** after Ubuntu/Debian, which distro family next —
-   RHEL/Fedora or Alpine — and is LXC support needed early or late?
+4. **`vps-audit` `--json` PR sequencing** — add the machine-readable/exit-code
+   mode in this PR series or a separate one on the `vps-audit` branch?
+5. **Critical-vs-warn classification** — which of the 53 `vps-audit` checks count
+   as *critical* (block roll-forward) vs warn-only?
