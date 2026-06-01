@@ -1,7 +1,7 @@
 # VPS Hardening Suite — Design & Implementation Plan
 
-Status: **Phase 1 implemented** — container guard + per-step backout are in
-`vps-lockdown.sh`; remaining phases (§6) still planned.
+Status: **Phases 1–2 implemented** — container guard + per-step backout +
+`install_admin_key()` are in `vps-lockdown.sh`; remaining phases (§6) still planned.
 Target script: `vps-lockdown.sh` (+ `vps-audit.sh` as the verification companion)
 Branch: `claude/ssh-key-hardening-bitwarden-QqjuH`
 
@@ -226,7 +226,15 @@ shippable. Nothing here is dropped; later phases are simply later.
 > library (`init_backout`, `step_begin`, `change_record`, `record_inverse`,
 > `step_revert`, `step_commit`) writes a manifest under
 > `/var/backups/vps-harden/<run-id>/` and auto-reverts a failed step (wired into
-> swap, server-hardening, and SSH-config changes). Phases 2–7 remain planned.
+> swap, server-hardening, and SSH-config changes).
+>
+> **Phase 2** adds `install_admin_key()` (called after `add_user`): installs a
+> supplied admin **public** key (`AUTHORIZED_KEY` env or prompt) — validated via
+> `ssh-keygen -l -f` with a prefix-regex fallback, private keys refused — into the
+> target user's `authorized_keys` (append + dedupe, perms 600 / `.ssh` 700).
+> When a key is supplied, `add_user()` skips its blind copy of root's
+> `authorized_keys`; with no key supplied, that copy-from-root fallback is kept.
+> Phases 3–7 remain planned.
 
 1. **Phase 1 — Per-step backout foundation (§7.1) + container guard.** A
    `change_record` + per-step `trap`-revert helper so every subsequent mutating

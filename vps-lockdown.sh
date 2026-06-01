@@ -534,8 +534,13 @@ function add_user() {
             echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
             echo " $(date +%m.%d.%Y_%H:%M:%S) : SUCCESS : '${UNAME,,}' added to SUDO group" | tee -a "$LOGFILE"
             echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
-            # copy SSH keys if they exist
-            if [ -e /root/.ssh/authorized_keys ]
+            # copy SSH keys (FALLBACK only): when an admin public key is supplied
+            # via AUTHORIZED_KEY, install_admin_key() places it and we do NOT
+            # blindly copy root's authorized_keys (which may hold stale/unknown keys).
+            if [ -n "${AUTHORIZED_KEY:-}" ]
+            then
+                echo " $(date +%m.%d.%Y_%H:%M:%S) : Admin key supplied; skipping copy of root's authorized_keys" | tee -a "$LOGFILE"
+            elif [ -e /root/.ssh/authorized_keys ]
             then mkdir /home/"${UNAME,,}"/.ssh
                 chmod 700 /home/"${UNAME,,}"/.ssh
                 # copy root SSH key to new non-root user
@@ -559,6 +564,97 @@ function add_user() {
     echo -e "---------------------------------------------- " | tee -a "$LOGFILE"
     echo -e " $(date +%m.%d.%Y_%H:%M:%S) : USER SETUP IS COMPLETE " | tee -a "$LOGFILE"
     echo -e "---------------------------------------------- " | tee -a "$LOGFILE"
+    echo -e -n "${nocolor}"
+}
+
+##########################
+## INSTALL ADMIN SSH KEY ##
+##########################
+
+function install_admin_key() {
+    # Phase 2: install a supplied admin PUBLIC key (public key only).
+    # Source of the key: AUTHORIZED_KEY env var (set by automation / future
+    # --admin-key flag) or an interactive prompt. When a key is supplied we
+    # install it (append + dedupe) and rely on add_user() having skipped the
+    # blind copy of root's authorized_keys. If none is supplied we do nothing -
+    # add_user()'s copy-from-root fallback already ran.
+    local key="${AUTHORIZED_KEY:-}"
+
+    # No key from env -> offer an interactive prompt.
+    if [ -z "$key" ]; then
+        echo -e -n "${lightcyan}"
+        figlet Admin Key | tee -a "$LOGFILE"
+        echo -e -n "${cyan}"
+        echo -e " You can install an admin SSH PUBLIC key now (recommended)."
+        echo -e " Paste one public key line (e.g. 'ssh-ed25519 AAAA... you@host'),"
+        echo -e " or just press ENTER to skip and keep existing key handling.\n"
+        read -r -p " Admin public key (or ENTER to skip): " key
+        echo -e "${nocolor}"
+    fi
+
+    # Nothing supplied -> skip cleanly.
+    if [ -z "$key" ]; then
+        echo -e -n "${yellow}"
+        echo -e " --> No admin public key supplied; skipping (existing key handling kept)." | tee -a "$LOGFILE"
+        echo -e -n "${nocolor}"
+        return 0
+    fi
+
+    # Refuse anything that looks like a PRIVATE key - never put one on the server.
+    if echo "$key" | grep -qiE 'PRIVATE KEY'; then
+        echo -e -n "${lightred}"
+        echo -e " --> That looks like a PRIVATE key. Never place a private key on the server. Skipping." | tee -a "$LOGFILE"
+        echo -e -n "${nocolor}"
+        return 0
+    fi
+
+    # Validate it is a real public key. Prefer ssh-keygen; if that tool is
+    # unavailable, fall back to a prefix check so a valid key is not rejected.
+    local valid="no"
+    if command -v ssh-keygen >/dev/null 2>&1; then
+        local tmpkey; tmpkey="$(mktemp)"
+        printf '%s\n' "$key" > "$tmpkey"
+        if ssh-keygen -l -f "$tmpkey" >/dev/null 2>&1; then valid="yes"; fi
+        rm -f "$tmpkey"
+    elif echo "$key" | grep -qE '^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-[a-z0-9-]+|sk-(ssh-ed25519|ecdsa-sha2-)[a-z0-9@.-]*) [A-Za-z0-9+/]+=*( .*)?$'; then
+        valid="yes"
+    fi
+    if [ "$valid" != "yes" ]; then
+        echo -e -n "${lightred}"
+        echo -e " --> Not a valid SSH public key; skipping admin key install." | tee -a "$LOGFILE"
+        echo -e -n "${nocolor}"
+        return 0
+    fi
+
+    # Target the new non-root user if one was created, else root.
+    local target home akfile
+    if [ -n "${UNAME:-}" ] && id -u "${UNAME,,}" >/dev/null 2>&1; then
+        target="${UNAME,,}"
+    else
+        target="root"
+    fi
+    home="$(getent passwd "$target" | cut -d: -f6)"
+    [ -z "$home" ] && home="/root"
+    akfile="$home/.ssh/authorized_keys"
+
+    step_begin "install_admin_key"
+    install -d -m 700 -o "$target" -g "$target" "$home/.ssh"
+    change_record "$akfile"
+    touch "$akfile"
+    # Append only if not already present (dedupe).
+    if grep -qxF "$key" "$akfile" 2>/dev/null; then
+        echo -e " --> Admin key already present for $target; no change made." | tee -a "$LOGFILE"
+    else
+        printf '%s\n' "$key" >> "$akfile"
+    fi
+    chown "$target":"$target" "$akfile"
+    chmod 600 "$akfile"
+    step_commit
+
+    echo -e -n "${lightgreen}"
+    echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
+    echo -e " $(date +%m.%d.%Y_%H:%M:%S) : SUCCESS : admin public key installed for $target" | tee -a "$LOGFILE"
+    echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
     echo -e -n "${nocolor}"
 }
 
@@ -1459,6 +1555,7 @@ update_upgrade
 favored_packages
 crypto_packages
 add_user
+install_admin_key
 collect_sshd
 prompt_rootlogin
 disable_passauth
