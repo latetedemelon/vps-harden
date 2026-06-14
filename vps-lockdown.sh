@@ -236,6 +236,71 @@ function step_commit() {
     echo "COMMIT $CURRENT_STEP $(date +%s)" >> "$MANIFEST"
 }
 
+############################################
+## CLI ARGS & NON-INTERACTIVE MODE (Ph 5) ##
+############################################
+
+function usage() {
+    cat <<USAGE
+Usage: vps-lockdown.sh [options]
+
+  --admin-key "KEY"        Install this SSH PUBLIC key for the admin user
+  --admin-key-file PATH    Read the admin public key from a file
+  --ssh-port N             Use SSH port N (else prompt / keep 22)
+  --user NAME              Create/!use this non-root sudo user
+  --yes, -y                Non-interactive: auto-answer prompts with safe
+                           defaults (does NOT disable password auth unless an
+                           admin key is supplied; does NOT disable root login
+                           unless a user or key is supplied)
+  --audit                  Run the read-only vps-audit companion and exit
+  --ignore-audit-failures  Do not halt on a failed critical audit check
+  -h, --help               Show this help and exit
+USAGE
+}
+
+# Parse CLI flags. Unattended automation sets values here; interactive runs use
+# the prompts. Keeps everything optional so a bare run behaves exactly as before.
+function parse_args() {
+    ASSUME_YES="no"; IGNORE_AUDIT_FAILURES="no"; AUDIT_ONLY="no"
+    SSH_PORT_OPT=""; USER_OPT=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --admin-key)            shift; AUTHORIZED_KEY="$1" ;;
+            --admin-key=*)          AUTHORIZED_KEY="${1#*=}" ;;
+            --admin-key-file)       shift; AUTHORIZED_KEY="$(cat "$1" 2>/dev/null)" ;;
+            --admin-key-file=*)     AUTHORIZED_KEY="$(cat "${1#*=}" 2>/dev/null)" ;;
+            --ssh-port)             shift; SSH_PORT_OPT="$1" ;;
+            --ssh-port=*)           SSH_PORT_OPT="${1#*=}" ;;
+            --user)                 shift; USER_OPT="$1" ;;
+            --user=*)               USER_OPT="${1#*=}" ;;
+            --yes|-y)               ASSUME_YES="yes" ;;
+            --ignore-audit-failures|--force-forward) IGNORE_AUDIT_FAILURES="yes" ;;
+            --audit)                AUDIT_ONLY="yes" ;;
+            -h|--help)              usage; exit 0 ;;
+            *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+        esac
+        shift
+    done
+    export AUTHORIZED_KEY ASSUME_YES IGNORE_AUDIT_FAILURES AUDIT_ONLY SSH_PORT_OPT USER_OPT
+}
+
+# Ask a yes/no question. In --yes (ASSUME_YES) mode, auto-answers with DEFAULT
+# instead of blocking on input. Usage: ask_yn VARNAME "prompt ... y/n" DEFAULT
+function ask_yn() {
+    local __var="$1" __prompt="$2" __def="$3" __ans=""
+    if [ "${ASSUME_YES:-no}" = "yes" ]; then
+        __ans="$__def"
+        echo -e "${cyan} $__prompt -> ${__def} (non-interactive)${nocolor}" | tee -a "$LOGFILE"
+    else
+        while :; do
+            echo -e "\n"
+            read -n 1 -s -r -p " $__prompt " __ans
+            [[ ${__ans,,} == "y" || ${__ans,,} == "n" ]] && break
+        done
+    fi
+    printf -v "$__var" '%s' "$__ans"
+}
+
 #########################
 ## CHECK & CREATE SWAP ##
 #########################
@@ -401,14 +466,7 @@ function crypto_packages() {
     echo -e "\n"
 
         echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to install these crypto packages now? y/n  " INSTALLCRYPTO
-            if [[ ${INSTALLCRYPTO,,} == "y" || ${INSTALLCRYPTO,,} == "Y" || ${INSTALLCRYPTO,,} == "N" || ${INSTALLCRYPTO,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            ask_yn INSTALLCRYPTO "Would you like to install these crypto packages now? y/n" "n"
         echo -e "${nocolor}"
 
     # check if INSTALLCRYPTO is valid
@@ -489,14 +547,7 @@ function add_user() {
     echo -e " non-root user if you want me to, but it is not required. \n"
     
             echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to add a non-root user? y/n  " ADDUSER
-            if [[ ${ADDUSER,,} == "y" || ${ADDUSER,,} == "Y" || ${ADDUSER,,} == "N" || ${ADDUSER,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            if [ -n "${USER_OPT:-}" ]; then ADDUSER="y"; else ask_yn ADDUSER "Would you like to add a non-root user? y/n" "n"; fi
         echo -e "${nocolor}"
 
     # check if ADDUSER is valid
@@ -505,12 +556,14 @@ function add_user() {
         echo -e -n "${yellow}"
         echo -e " Great; let's set one up now... \n"
         echo -e -n "${cyan}"
+        if [ -n "${USER_OPT:-}" ]; then UNAME="$USER_OPT"; else
         read -p " Enter New Username: " UNAME
         while [[ "$UNAME" =~ [^0-9A-Za-z]+ ]] || [ -z "$UNAME" ]; do echo -e "\n"
             echo -e -n "${lightred}"
             read -p " --> Please enter a username that contains only letters or numbers: " UNAME
             echo -e -n "${nocolor}"
         done
+        fi
         echo -e "\n"
         echo -e -n "${yellow}"
         echo  -e " User elected to create a new user named ${UNAME,,}. \n" >> $LOGFILE 2>&1
@@ -580,8 +633,8 @@ function install_admin_key() {
     # add_user()'s copy-from-root fallback already ran.
     local key="${AUTHORIZED_KEY:-}"
 
-    # No key from env -> offer an interactive prompt.
-    if [ -z "$key" ]; then
+    # No key from env -> offer an interactive prompt (skipped in non-interactive mode).
+    if [ -z "$key" ] && [ "${ASSUME_YES:-no}" != "yes" ]; then
         echo -e -n "${lightcyan}"
         figlet Admin Key | tee -a "$LOGFILE"
         echo -e -n "${cyan}"
@@ -679,20 +732,26 @@ function collect_sshd() {
     echo -e " By default, SSH traffic occurs on port 22, so hackers are always"
     echo -e " scanning port 22 for vulnerabilities. If you change your server to"
     echo -e " use a different port, you gain some security through obscurity.\n"
-    while :; do
-        echo -e -n "${cyan}"
-        read -p " Enter a custom port for SSH between 11000 and 65535 or use 22: " SSHPORT
-        [[ $SSHPORT =~ ^[0-9]+$ ]] || { echo -e -n "${lightred}";echo -e " --> Try harder, that's not even a number. \n";echo -e -n "${nocolor}";continue; }
-        if (($SSHPORT >= 11000 && $SSHPORT <= 65535)); then break
-        elif [ "$SSHPORT" = 22 ]; then break
-        else echo -e -n "${lightred}"
-            echo -e " --> That number is out of range, try again. \n"
-            echo "---------------------------------------------------- " >> $LOGFILE 2>&1
-            echo " $(date +%m.%d.%Y_%H:%M:%S) : ERROR: User entered: $SSHPORT " >> $LOGFILE 2>&1
-            echo "---------------------------------------------------- " >> $LOGFILE 2>&1
-            echo -e -n "${nocolor}"
-        fi
-    done
+    if [ -n "${SSH_PORT_OPT:-}" ]; then
+        SSHPORT="$SSH_PORT_OPT"
+    elif [ "${ASSUME_YES:-no}" = "yes" ]; then
+        SSHPORT="22"
+    else
+        while :; do
+            echo -e -n "${cyan}"
+            read -p " Enter a custom port for SSH between 11000 and 65535 or use 22: " SSHPORT
+            [[ $SSHPORT =~ ^[0-9]+$ ]] || { echo -e -n "${lightred}";echo -e " --> Try harder, that's not even a number. \n";echo -e -n "${nocolor}";continue; }
+            if (($SSHPORT >= 11000 && $SSHPORT <= 65535)); then break
+            elif [ "$SSHPORT" = 22 ]; then break
+            else echo -e -n "${lightred}"
+                echo -e " --> That number is out of range, try again. \n"
+                echo "---------------------------------------------------- " >> $LOGFILE 2>&1
+                echo " $(date +%m.%d.%Y_%H:%M:%S) : ERROR: User entered: $SSHPORT " >> $LOGFILE 2>&1
+                echo "---------------------------------------------------- " >> $LOGFILE 2>&1
+                echo -e -n "${nocolor}"
+            fi
+        done
+    fi
     # Take a backup of the existing config (also record it in the backout manifest)
     step_begin "ssh_config"
     change_record "$SSHDFILE"
@@ -760,14 +819,10 @@ function prompt_rootlogin {
         echo -e "---------------------------------------------------- \n" | tee -a "$LOGFILE"
         
             echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to disable root login? y/n  " ROOTLOGIN
-            if [[ ${ROOTLOGIN,,} == "y" || ${ROOTLOGIN,,} == "Y" || ${ROOTLOGIN,,} == "N" || ${ROOTLOGIN,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            # non-interactive default: only disable root login if a non-root user
+            # or an admin key exists, to avoid locking out the only access.
+            if [ -n "${USER_OPT:-}" ] || [ -n "${AUTHORIZED_KEY:-}" ]; then _rl_def="y"; else _rl_def="n"; fi
+            ask_yn ROOTLOGIN "Would you like to disable root login? y/n" "$_rl_def"
         echo -e "${nocolor}"
         
         # check if ROOTLOGIN is valid
@@ -853,14 +908,10 @@ function disable_passauth() {
         echo -e "--------------------------------------------------- " >> $LOGFILE 2>&1
         
         echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to disable password login & require RSA key login? y/n  " PASSLOGIN
-            if [[ ${PASSLOGIN,,} == "y" || ${PASSLOGIN,,} == "Y" || ${PASSLOGIN,,} == "N" || ${PASSLOGIN,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            # non-interactive default: only require key-only login when an admin
+            # key was supplied - otherwise this would lock out password users.
+            if [ -n "${AUTHORIZED_KEY:-}" ]; then _pa_def="y"; else _pa_def="n"; fi
+            ask_yn PASSLOGIN "Would you like to disable password login & require RSA key login? y/n" "$_pa_def"
         echo -e "${nocolor}\n"
         
         # check if PASSLOGIN is valid
@@ -935,14 +986,7 @@ function ufw_config() {
     echo -e " * If you already configured UFW, choose NO to keep your existing rules\n"
     
         echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to enable UFW firewall and assign basic rules? y/n  " FIREWALLP
-            if [[ ${FIREWALLP,,} == "y" || ${FIREWALLP,,} == "Y" || ${FIREWALLP,,} == "N" || ${FIREWALLP,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            ask_yn FIREWALLP "Would you like to enable UFW firewall and assign basic rules? y/n" "y"
         echo -e "${nocolor}\n"
     
     if { [ "${FIREWALLP,,}" = "Y" ] || [ "${FIREWALLP,,}" = "y" ]; } && skip_in_container "firewall (UFW) configuration"; then
@@ -1001,14 +1045,7 @@ function server_hardening() {
     echo -e " installation of security updates.\n"
 
         echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to perform these steps now? y/n  " GETHARD
-            if [[ ${GETHARD,,} == "y" || ${GETHARD,,} == "Y" || ${GETHARD,,} == "N" || ${GETHARD,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            ask_yn GETHARD "Would you like to perform these steps now? y/n" "y"
         echo -e "${nocolor}\n"    
     
     # check if GETHARD is valid
@@ -1137,14 +1174,7 @@ function google_auth() {
     echo -e " requires you to use the Google Authenticator app on your phone.\n"
 
         echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to install Google 2FA Authentication? y/n  " GOOGLEAUTH
-            if [[ ${GOOGLEAUTH,,} == "y" || ${GOOGLEAUTH,,} == "Y" || ${GOOGLEAUTH,,} == "N" || ${GOOGLEAUTH,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            ask_yn GOOGLEAUTH "Would you like to install Google 2FA Authentication? y/n" "n"
         echo -e "${nocolor}\n"    
     
     # check if GOOGLEAUTH is valid
@@ -1244,14 +1274,7 @@ function ksplice_install() {
     echo -e " To minimize server downtime, this is a good thing to install.\n"
     
         echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to install Oracle Ksplice Uptrack now? y/n  " KSPLICE
-            if [[ ${KSPLICE,,} == "y" || ${KSPLICE,,} == "Y" || ${KSPLICE,,} == "N" || ${KSPLICE,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            ask_yn KSPLICE "Would you like to install Oracle Ksplice Uptrack now? y/n" "n"
         echo -e "${nocolor}\n" 
 
         if [ "${KSPLICE,,}" = "Y" ] || [ "${KSPLICE,,}" = "y" ]
@@ -1356,14 +1379,7 @@ function motd_install() {
     echo -e " access.  All modifications are strictly cosmetic.\n"
 
         echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to enhance your MOTD & login banner? y/n  " MOTDP
-            if [[ ${MOTDP,,} == "y" || ${MOTDP,,} == "Y" || ${MOTDP,,} == "N" || ${MOTDP,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            ask_yn MOTDP "Would you like to enhance your MOTD & login banner? y/n" "y"
         echo -e "${nocolor}\n" 
 
     # check if MOTDP is affirmative
@@ -1425,14 +1441,7 @@ function restart_sshd() {
     echo -e " from getting locked out of your server.\n"
 
         echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to restart SSHD and enable UFW now? y/n  " SSHDRESTART
-            if [[ ${SSHDRESTART,,} == "y" || ${SSHDRESTART,,} == "Y" || ${SSHDRESTART,,} == "N" || ${SSHDRESTART,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            ask_yn SSHDRESTART "Would you like to restart SSHD and enable UFW now? y/n" "y"
         echo -e "${nocolor}\n" 
 
     # check if SSHDRESTART is valid
@@ -1495,10 +1504,9 @@ function bitwarden_backup() {
     echo -e -n "${cyan}"
 
     local DOBW=""
-    while :; do
-        read -n 1 -s -r -p " Back up SSH host keys to Bitwarden now? y/n  " DOBW
-        [[ ${DOBW,,} == "y" || ${DOBW,,} == "n" ]] && break
-    done
+    # non-interactive default: skip unless a session is pre-supplied via BW_SESSION
+    local _bw_def="n"; [ -n "${BW_SESSION:-}" ] && _bw_def="y"
+    ask_yn DOBW "Back up SSH host keys to Bitwarden now? y/n" "$_bw_def"
     echo -e "${nocolor}\n"
     if [ "${DOBW,,}" != "y" ]; then
         echo -e -n "${yellow}"
@@ -1730,15 +1738,8 @@ EOF
     echo -e -n "${nocolor}"
 }
 
-# ---- lightweight CLI flag scan (full parser arrives in Phase 5) ----
-IGNORE_AUDIT_FAILURES="no"
-AUDIT_ONLY="no"
-for _arg in "$@"; do
-    case "$_arg" in
-        --ignore-audit-failures|--force-forward) IGNORE_AUDIT_FAILURES="yes" ;;
-        --audit) AUDIT_ONLY="yes" ;;
-    esac
-done
+# ---- parse CLI flags (non-interactive automation) ----
+parse_args "$@"
 
 # --audit: read-only mode - just run the audit companion and exit, no changes.
 if [ "$AUDIT_ONLY" = "yes" ]; then

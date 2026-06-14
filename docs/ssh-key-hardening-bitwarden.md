@@ -1,9 +1,11 @@
 # VPS Hardening Suite — Design & Implementation Plan
 
-Status: **Phases 1–4 implemented** — container guard + per-step backout +
-`install_admin_key()` + optional `bitwarden_backup()` + the `vps-audit` audit gate
-are in `vps-lockdown.sh` (with the `vps-audit --json` companion in
-[vps-audit#3](https://github.com/latetedemelon/vps-audit/pull/3)); Phases 5–7 still planned.
+Status: **Phases 1–4 + Phase 5 (CLI/non-interactive) implemented** — container
+guard, per-step backout, `install_admin_key()`, optional `bitwarden_backup()`, the
+`vps-audit` audit gate, and a non-interactive CLI flag parser are in
+`vps-lockdown.sh` (with the `vps-audit --json` companion in
+[vps-audit#3](https://github.com/latetedemelon/vps-audit/pull/3)). Remaining in
+Phase 5: Secrets Manager profile + local key-bootstrap script. Phases 6–7 planned.
 Target script: `vps-lockdown.sh` (+ `vps-audit.sh` as the verification companion)
 Branch: `claude/ssh-key-hardening-bitwarden-QqjuH`
 
@@ -254,8 +256,19 @@ shippable. Nothing here is dropped; later phases are simply later.
 > **halts with exit 2 if any critical check FAILed** unless
 > `--ignore-audit-failures` is set — non-fatal/skipped when the audit tool is
 > absent. A `--audit` flag runs the read-only audit and exits without changes.
-> The matching `vps-audit --json`/exit-code companion is vps-audit#3. Phases 5–7
-> remain planned (full CLI flag parser, distro/LXC profiles + CIS depth, docs).
+> The matching `vps-audit --json`/exit-code companion is vps-audit#3.
+>
+> **Phase 5 (CLI/non-interactive, in progress)** adds `parse_args()` + `ask_yn()`:
+> flags `--admin-key`/`--admin-key-file`, `--ssh-port`, `--user`, `--yes`,
+> `--audit`, `--ignore-audit-failures`, `--help`. In `--yes` mode every prompt
+> auto-answers a safe default **without blocking** — and, to avoid lockout, it
+> only disables password auth when an admin key was supplied and only disables
+> root login when a user or key exists. Still pending in Phase 5: the Bitwarden
+> **Secrets Manager** profile and the **local key-bootstrap** script. Phase 6
+> (distro/LXC profiles + CIS depth) and Phase 7 (docs) remain planned.
+>
+> ⚠️ `--yes` is validated in isolation (parsing + non-blocking defaults); the full
+> unattended run needs a real-VM test before production use.
 
 1. **Phase 1 — Per-step backout foundation (§7.1) + container guard.** A
    `change_record` + per-step `trap`-revert helper so every subsequent mutating
