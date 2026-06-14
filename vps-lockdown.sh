@@ -1504,8 +1504,9 @@ function bitwarden_backup() {
     echo -e -n "${cyan}"
 
     local DOBW=""
-    # non-interactive default: skip unless a session is pre-supplied via BW_SESSION
-    local _bw_def="n"; [ -n "${BW_SESSION:-}" ] && _bw_def="y"
+    # non-interactive default: skip unless a vault session or Secrets Manager
+    # token is pre-supplied (BW_SESSION / BWS_ACCESS_TOKEN).
+    local _bw_def="n"; { [ -n "${BW_SESSION:-}" ] || [ -n "${BWS_ACCESS_TOKEN:-}" ]; } && _bw_def="y"
     ask_yn DOBW "Back up SSH host keys to Bitwarden now? y/n" "$_bw_def"
     echo -e "${nocolor}\n"
     if [ "${DOBW,,}" != "y" ]; then
@@ -1513,6 +1514,31 @@ function bitwarden_backup() {
         echo -e " --> User declined Bitwarden host-key backup; skipping." | tee -a "$LOGFILE"
         echo -e -n "${nocolor}"
         return 0
+    fi
+
+    # --- Bitwarden Secrets Manager profile (unattended automation) ---
+    # If a machine-account token is present and the bws CLI is available, store
+    # each host key as a base64 secret instead of using an interactive vault.
+    if [ -n "${BWS_ACCESS_TOKEN:-}" ] && command -v bws >/dev/null 2>&1; then
+        if [ -z "${BWS_PROJECT_ID:-}" ]; then
+            echo -e " --> BWS_ACCESS_TOKEN set but BWS_PROJECT_ID missing; falling back to bw vault." | tee -a "$LOGFILE"
+        else
+            set +x
+            local sf sbase scount=0
+            for sf in /etc/ssh/ssh_host_*; do
+                [ -e "$sf" ] || continue
+                sbase="vps-harden/$(hostname)/$(basename "$sf")"
+                if bws secret create "$sbase" "$(base64 -w0 "$sf")" "$BWS_PROJECT_ID" >/dev/null 2>>"$LOGFILE"; then
+                    scount=$((scount+1))
+                else
+                    echo -e " --> bws secret create failed for $sf" | tee -a "$LOGFILE"
+                fi
+            done
+            echo -e -n "${lightgreen}"
+            echo -e " --> Stored $scount host-key secret(s) via Bitwarden Secrets Manager." | tee -a "$LOGFILE"
+            echo -e -n "${nocolor}"
+            return 0
+        fi
     fi
 
     # Soft dependencies - detect, never auto-install.
