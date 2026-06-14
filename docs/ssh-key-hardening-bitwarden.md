@@ -1,11 +1,13 @@
 # VPS Hardening Suite — Design & Implementation Plan
 
-Status: **Phases 1–4 + Phase 5 (CLI/non-interactive) implemented** — container
-guard, per-step backout, `install_admin_key()`, optional `bitwarden_backup()`, the
-`vps-audit` audit gate, and a non-interactive CLI flag parser are in
-`vps-lockdown.sh` (with the `vps-audit --json` companion in
-[vps-audit#3](https://github.com/latetedemelon/vps-audit/pull/3)). Remaining in
-Phase 5: Secrets Manager profile + local key-bootstrap script. Phases 6–7 planned.
+Status: **Phases 1–5 complete + Phase 6 foundation** — container guard, per-step
+backout, `install_admin_key()`, optional `bitwarden_backup()` (vault + Secrets
+Manager), the `vps-audit` audit gate, a non-interactive CLI flag parser, the
+`bootstrap-admin-key.sh` helper, and a distro/package/service abstraction are in
+place (with the `vps-audit --json` companion in
+[vps-audit#3](https://github.com/latetedemelon/vps-audit/pull/3)). Remaining:
+full RHEL/Alpine package+firewall profiles and CIS-depth controls (Phase 6
+continuation), and docs (Phase 7).
 Target script: `vps-lockdown.sh` (+ `vps-audit.sh` as the verification companion)
 Branch: `claude/ssh-key-hardening-bitwarden-QqjuH`
 
@@ -269,6 +271,22 @@ shippable. Nothing here is dropped; later phases are simply later.
 >
 > ⚠️ `--yes` is validated in isolation (parsing + non-blocking defaults); the full
 > unattended run needs a real-VM test before production use.
+>
+> **Phase 5 (complete)** also adds the Bitwarden **Secrets Manager** path in
+> `bitwarden_backup()` (uses `bws` + `BWS_ACCESS_TOKEN`/`BWS_PROJECT_ID` to store
+> host keys as base64 secrets, else falls back to the vault) and the
+> **`bootstrap-admin-key.sh`** helper (generate key + store the private key in
+> Bitwarden on a trusted machine; emit only the public key).
+>
+> **Phase 6 (foundation)** adds distro awareness: `check_distro()` now classifies
+> the family (Debian → Red Hat → Alpine) instead of hard-requiring Ubuntu, plus
+> `detect_pkg_mgr()`, `pkg_install()`, `svc_enable()`, `svc_restart()` (e.g.
+> `sshd`/`ssh`), and `is_debian_family()`. apt/ufw-specific steps (updates,
+> package installs, UFW, unattended-upgrades) now **skip cleanly on non-Debian**
+> rather than erroring; universal steps (user, SSH config, backout, audit,
+> service restart) run everywhere. **Still to do:** real RHEL/Alpine package +
+> firewall (firewalld/nftables) profiles, `adduser`→`useradd` portability, and
+> CIS-depth controls (auditd/AppArmor/sysctl/AIDE). Phase 7 = docs.
 
 1. **Phase 1 — Per-step backout foundation (§7.1) + container guard.** A
    `change_record` + per-step `trap`-revert helper so every subsequent mutating

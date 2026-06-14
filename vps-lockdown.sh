@@ -87,18 +87,33 @@ function setup_environment() {
 }
 
 function check_distro() {
-    # currently only for Ubuntu 16.04
+    # Classify the distro family (priority: Debian -> Red Hat -> Alpine) and pick
+    # the package manager. Debian family is fully supported; others are EXPERIMENTAL.
     if [[ -r /etc/os-release ]]; then
         . /etc/os-release
-        if [[ "${VERSION_ID}" != "16.04" ]] ; then
-            echo -e "\nThis script works the very best with Ubuntu 16.04 LTS."
-            echo -e "Some elements of this script won't work correctly on other releases.\n"
-        fi
+        case " ${ID_LIKE:-} ${ID:-} " in
+            *debian*|*ubuntu*)        DISTRO_FAMILY="debian" ;;
+            *rhel*|*fedora*|*centos*) DISTRO_FAMILY="rhel" ;;
+            *alpine*)                 DISTRO_FAMILY="alpine" ;;
+            *suse*)                   DISTRO_FAMILY="suse" ;;
+            *arch*)                   DISTRO_FAMILY="arch" ;;
+            *)                        DISTRO_FAMILY="unknown" ;;
+        esac
     else
-        # no, thats not ok!
-        echo -e "This script only supports Ubuntu 16.04, exiting.\n"
+        echo -e "Cannot read /etc/os-release; unsupported system, exiting.\n"
         exit 1
     fi
+    detect_pkg_mgr
+    export DISTRO_FAMILY
+    case "$DISTRO_FAMILY" in
+        debian) : ;;  # fully supported
+        rhel|alpine|suse|arch)
+            echo -e "\n'$DISTRO_FAMILY' family detected ($PKG_MGR) - EXPERIMENTAL."
+            echo -e "Universal steps run; apt/ufw-specific hardening is skipped until"
+            echo -e "this distro's profile is implemented.\n" ;;
+        *)
+            echo -e "\nUnrecognized distro - EXPERIMENTAL; proceeding with universal steps only.\n" ;;
+    esac
 }
 
 function begin_log() {
@@ -301,6 +316,63 @@ function ask_yn() {
     printf -v "$__var" '%s' "$__ans"
 }
 
+############################################
+## DISTRO / PACKAGE / SERVICE ABSTRACTION ##
+############################################
+# Phase 6 foundation: detect the package manager + init system so the suite can
+# run beyond Ubuntu (priority Debian -> Red Hat -> Alpine). The Debian family is
+# fully supported today; on other families the universal steps (user, SSH config,
+# backout, audit, service restart) run and apt/ufw-specific steps are skipped.
+# Full per-distro package/firewall/CIS profiles are the next increment.
+
+function detect_pkg_mgr() {
+    if command -v apt-get >/dev/null 2>&1; then PKG_MGR="apt"
+    elif command -v dnf >/dev/null 2>&1; then PKG_MGR="dnf"
+    elif command -v yum >/dev/null 2>&1; then PKG_MGR="yum"
+    elif command -v zypper >/dev/null 2>&1; then PKG_MGR="zypper"
+    elif command -v pacman >/dev/null 2>&1; then PKG_MGR="pacman"
+    elif command -v apk >/dev/null 2>&1; then PKG_MGR="apk"
+    else PKG_MGR="unknown"; fi
+    export PKG_MGR
+}
+
+function pkg_install() {
+    case "${PKG_MGR:-unknown}" in
+        apt)    DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+        dnf)    dnf install -y "$@" ;;
+        yum)    yum install -y "$@" ;;
+        zypper) zypper --non-interactive install "$@" ;;
+        pacman) pacman -S --noconfirm "$@" ;;
+        apk)    apk add "$@" ;;
+        *) return 1 ;;
+    esac
+}
+
+function svc_enable() {
+    if command -v systemctl >/dev/null 2>&1; then systemctl enable "$1" >/dev/null 2>&1
+    elif command -v rc-update >/dev/null 2>&1; then rc-update add "$1" >/dev/null 2>&1
+    fi
+}
+
+# Restart the first service name that exists (e.g. svc_restart sshd ssh).
+function svc_restart() {
+    local s
+    for s in "$@"; do
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl restart "$s" >/dev/null 2>&1 && return 0
+        elif command -v rc-service >/dev/null 2>&1; then
+            rc-service "$s" restart >/dev/null 2>&1 && return 0
+        elif command -v service >/dev/null 2>&1; then
+            service "$s" restart >/dev/null 2>&1 && return 0
+        fi
+    done
+    return 1
+}
+
+# True only on the fully-supported Debian/Ubuntu family. Used to skip apt/ufw-
+# specific steps cleanly on other distros until their profiles are implemented.
+function is_debian_family() { [ "${DISTRO_FAMILY:-}" = "debian" ]; }
+
 #########################
 ## CHECK & CREATE SWAP ##
 #########################
@@ -361,6 +433,7 @@ function create_swap() {
 ######################
 
 function update_upgrade() {
+    if ! is_debian_family; then echo -e "${yellow} --> Skipping apt update/upgrade on non-Debian distro.${nocolor}" | tee -a "$LOGFILE"; return 0; fi
 
     # NOTE I learned the hard way that you must put a "\" BEFORE characters "\" and "`"
     echo -e -n "${lightcyan}"
@@ -423,6 +496,7 @@ function update_upgrade() {
 #
 
 function favored_packages() {
+    if ! is_debian_family; then echo -e "${yellow} --> Skipping apt package install on non-Debian distro.${nocolor}" | tee -a "$LOGFILE"; return 0; fi
     # install my favorite and commonly used packages
     echo -e -n "${lightcyan}"
     figlet Install Favored | tee -a "$LOGFILE"
@@ -452,6 +526,7 @@ function favored_packages() {
 ## CRYPTO PACKAGES ##
 #####################
 function crypto_packages() {
+    if ! is_debian_family; then echo -e "${yellow} --> Skipping apt crypto-package install on non-Debian distro.${nocolor}" | tee -a "$LOGFILE"; return 0; fi
     echo -e -n "${lightcyan}"
     figlet Crypto Setup | tee -a "$LOGFILE"
     echo -e -n "${yellow}"
@@ -970,6 +1045,7 @@ function disable_passauth() {
 ################
 
 function ufw_config() {
+    if ! is_debian_family; then echo -e "${yellow} --> Skipping UFW config on non-Debian distro (use the host/distro firewall).${nocolor}" | tee -a "$LOGFILE"; FIREWALLP="n"; return 0; fi
     # query user to disable password authentication or not
     echo -e -n "${lightcyan}"
     figlet Firewall Config | tee -a "$LOGFILE"
@@ -1081,8 +1157,10 @@ function server_hardening() {
         echo -e " Replace /etc/ufw/before.rules with hardened rules " | tee -a "$LOGFILE"
         echo -e "---------------------------------------------------- \n " | tee -a "$LOGFILE"
         sleep 2	; #  dramatic pause
-        # netfilter/UFW rules are host-managed inside containers - skip there
-        if skip_in_container "UFW DDOS before.rules"; then :
+        # UFW before.rules is Debian/UFW-specific and host-managed in containers.
+        if ! is_debian_family; then
+            echo -e " --> Skipping UFW before.rules on non-Debian distro." | tee -a "$LOGFILE"
+        elif skip_in_container "UFW DDOS before.rules"; then :
         else
             change_record /etc/ufw/before.rules
             cat etc/ufw/before.rules > /etc/ufw/before.rules
@@ -1114,19 +1192,23 @@ function server_hardening() {
         echo -e "---------------------------------------------------- \n " | tee -a "$LOGFILE"
         sleep 2	; #  dramatic pause
 
-        . /etc/os-release
-        if [[ "${VERSION_ID}" = "16.04" ]]
-        then
-            change_record /etc/apt/apt.conf.d/10periodic
-            cat etc/apt/apt.conf.d/10periodic > /etc/apt/apt.conf.d/10periodic
+        # apt unattended-upgrades is Debian-specific.
+        if ! is_debian_family; then
+            echo -e " --> Skipping apt unattended-upgrades on non-Debian distro." | tee -a "$LOGFILE"
         else
-            change_record /etc/apt/apt.conf.d/20auto-upgrades
-            cat etc/apt/apt.conf.d/20auto-upgrades > /etc/apt/apt.conf.d/20auto-upgrades
+            . /etc/os-release
+            if [[ "${VERSION_ID}" = "16.04" ]]
+            then
+                change_record /etc/apt/apt.conf.d/10periodic
+                cat etc/apt/apt.conf.d/10periodic > /etc/apt/apt.conf.d/10periodic
+            else
+                change_record /etc/apt/apt.conf.d/20auto-upgrades
+                cat etc/apt/apt.conf.d/20auto-upgrades > /etc/apt/apt.conf.d/20auto-upgrades
+            fi
+            change_record /etc/apt/apt.conf.d/50unattended-upgrades
+            cat etc/apt/apt.conf.d/50unattended-upgrades > /etc/apt/apt.conf.d/50unattended-upgrades
+            # consider editing the above 50-unattended-upgrades to auto-reboot when necessary
         fi
-
-        change_record /etc/apt/apt.conf.d/50unattended-upgrades
-        cat etc/apt/apt.conf.d/50unattended-upgrades > /etc/apt/apt.conf.d/50unattended-upgrades
-        # consider editing the above 50-unattended-upgrades to automatically reboot when necessary
         step_commit
 
         # Error Handling
@@ -1448,7 +1530,7 @@ function restart_sshd() {
     if [ "${SSHDRESTART,,}" = "Y" ] || [ "${SSHDRESTART,,}" = "y" ]
     then
         # insert a pause or delay to add suspense
-        systemctl restart sshd
+        svc_restart sshd ssh
         if [ "$FIREWALLP" = "yes" ] || [ "$FIREWALLP" = "y" ]
         then ufw --force enable | tee -a "$LOGFILE"
             echo -e " \n" | tee -a "$LOGFILE"
