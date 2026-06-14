@@ -1586,6 +1586,81 @@ function bitwarden_backup() {
     echo -e -n "${nocolor}"
 }
 
+##############################
+## Audit Gate (vps-audit)   ##
+##############################
+
+# Locate the read-only vps-audit.sh companion, if present.
+function find_vps_audit() {
+    local c
+    for c in \
+        "$(dirname "$0")/vps-audit.sh" \
+        "$(dirname "$0")/../vps-audit/vps-audit.sh" \
+        "./vps-audit.sh" \
+        "../vps-audit/vps-audit.sh" \
+        "/opt/vps-audit/vps-audit.sh"; do
+        [ -f "$c" ] && { echo "$c"; return 0; }
+    done
+    command -v vps-audit.sh >/dev/null 2>&1 && { command -v vps-audit.sh; return 0; }
+    return 1
+}
+
+# 'Harden, then audit' gate: run vps-audit.sh --json and block roll-forward if any
+# CRITICAL check FAILs, unless --ignore-audit-failures was given. Read-only and
+# non-fatal when the audit tool is absent (it's a gate, not a hard dependency).
+function run_audit_gate() {
+    local label="${1:-post-hardening}"
+    local audit json crit
+    audit="$(find_vps_audit)" || true
+
+    echo -e -n "${lightcyan}"
+    figlet Audit Gate | tee -a "$LOGFILE"
+    echo -e -n "${nocolor}"
+
+    if [ -z "$audit" ]; then
+        echo -e -n "${yellow}"
+        echo -e " --> vps-audit.sh not found; skipping audit gate ($label)." | tee -a "$LOGFILE"
+        echo -e " (Place vps-audit.sh alongside this script or in ../vps-audit/ to enable it.)" | tee -a "$LOGFILE"
+        echo -e -n "${nocolor}"
+        return 0
+    fi
+
+    echo -e " Running read-only audit: $audit --json" | tee -a "$LOGFILE"
+    json="$(bash "$audit" --json 2>>"$LOGFILE")" || true
+
+    # Parse critical_fails with jq, fall back to grep if jq is unavailable.
+    if command -v jq >/dev/null 2>&1; then
+        crit="$(printf '%s' "$json" | jq -r '.critical_fails' 2>/dev/null)"
+    fi
+    if [ -z "$crit" ] || [ "$crit" = "null" ]; then
+        crit="$(printf '%s' "$json" | grep -o '"critical_fails":[0-9]*' | grep -o '[0-9]*' | head -n1)"
+    fi
+    [ -z "$crit" ] && crit=0
+
+    if [ "$crit" -gt 0 ] 2>/dev/null; then
+        echo -e -n "${lightred}"
+        echo -e " --> Audit gate ($label): $crit critical check(s) FAILED:" | tee -a "$LOGFILE"
+        if command -v jq >/dev/null 2>&1; then
+            printf '%s' "$json" | jq -r '.results[]? | select(.critical and .status=="FAIL") | "     - " + .name + ": " + .message' 2>/dev/null | tee -a "$LOGFILE"
+        fi
+        echo -e -n "${nocolor}"
+        if [ "${IGNORE_AUDIT_FAILURES:-no}" = "yes" ]; then
+            echo -e -n "${yellow}"
+            echo -e " --> Continuing anyway (--ignore-audit-failures set)." | tee -a "$LOGFILE"
+            echo -e -n "${nocolor}"
+        else
+            echo -e -n "${lightred}"
+            echo -e " --> Halting. Re-run with --ignore-audit-failures to override." | tee -a "$LOGFILE"
+            echo -e -n "${nocolor}"
+            exit 2
+        fi
+    else
+        echo -e -n "${lightgreen}"
+        echo -e " --> Audit gate ($label): no critical failures." | tee -a "$LOGFILE"
+        echo -e -n "${nocolor}"
+    fi
+}
+
 ######################
 ## Install Complete ##
 ######################
@@ -1655,6 +1730,24 @@ EOF
     echo -e -n "${nocolor}"
 }
 
+# ---- lightweight CLI flag scan (full parser arrives in Phase 5) ----
+IGNORE_AUDIT_FAILURES="no"
+AUDIT_ONLY="no"
+for _arg in "$@"; do
+    case "$_arg" in
+        --ignore-audit-failures|--force-forward) IGNORE_AUDIT_FAILURES="yes" ;;
+        --audit) AUDIT_ONLY="yes" ;;
+    esac
+done
+
+# --audit: read-only mode - just run the audit companion and exit, no changes.
+if [ "$AUDIT_ONLY" = "yes" ]; then
+    _audit="$(find_vps_audit)" || true
+    if [ -n "$_audit" ]; then bash "$_audit"; exit $?; fi
+    echo "vps-audit.sh not found; cannot run --audit." >&2
+    exit 1
+fi
+
 check_distro
 setup_environment
 display_banner
@@ -1678,5 +1771,6 @@ motd_install
 restart_sshd
 bitwarden_backup
 install_complete
+run_audit_gate "post-hardening"
 
 exit

@@ -1,8 +1,9 @@
 # VPS Hardening Suite — Design & Implementation Plan
 
-Status: **Phases 1–3 implemented** — container guard + per-step backout +
-`install_admin_key()` + optional `bitwarden_backup()` are in `vps-lockdown.sh`;
-remaining phases (§6) still planned.
+Status: **Phases 1–4 implemented** — container guard + per-step backout +
+`install_admin_key()` + optional `bitwarden_backup()` + the `vps-audit` audit gate
+are in `vps-lockdown.sh` (with the `vps-audit --json` companion in
+[vps-audit#3](https://github.com/latetedemelon/vps-audit/pull/3)); Phases 5–7 still planned.
 Target script: `vps-lockdown.sh` (+ `vps-audit.sh` as the verification companion)
 Branch: `claude/ssh-key-hardening-bitwarden-QqjuH`
 
@@ -245,7 +246,16 @@ shippable. Nothing here is dropped; later phases are simply later.
 > If anything is missing or fails, hardening still succeeds. **Note:** the
 > vault-interaction paths could not be executed in CI (no `bw`); only the
 > declined / `bw`-absent skip paths and syntax were validated — they need a
-> one-time check on a host with `bw` installed. Phases 4–7 remain planned.
+> one-time check on a host with `bw` installed.
+>
+> **Phase 4** adds the audit gate: `find_vps_audit()` locates the read-only
+> `vps-audit.sh`, and `run_audit_gate()` (run after `install_complete`) executes
+> it with `--json`, parses `critical_fails` (jq, with a grep fallback), and
+> **halts with exit 2 if any critical check FAILed** unless
+> `--ignore-audit-failures` is set — non-fatal/skipped when the audit tool is
+> absent. A `--audit` flag runs the read-only audit and exits without changes.
+> The matching `vps-audit --json`/exit-code companion is vps-audit#3. Phases 5–7
+> remain planned (full CLI flag parser, distro/LXC profiles + CIS depth, docs).
 
 1. **Phase 1 — Per-step backout foundation (§7.1) + container guard.** A
    `change_record` + per-step `trap`-revert helper so every subsequent mutating
