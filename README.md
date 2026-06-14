@@ -26,6 +26,60 @@ The following is a list of different sections of the script, which are broken up
 
 I aggregated these steps from several different server hardening guides and selected the most effective of them to include in this script. The goal is to make something simple enough for newcomers to use while still being practical and saving time for seasoned Linux veterans. I am certainly open to suggestions and would like to keep this easy and practical to use.
 
+## Usage
+
+Interactive (default):
+
+```bash
+sudo ./vps-lockdown.sh
+```
+
+Non-interactive / automation:
+
+```bash
+sudo ./vps-lockdown.sh \
+  --admin-key-file admin.pub \   # install this PUBLIC key for the admin user
+  --user alice \                 # create/use this non-root sudo user
+  --ssh-port 22 \                # SSH port (else prompt / keep 22)
+  --yes \                        # auto-answer prompts with safe defaults
+  --cis                          # optional CIS baseline (auditd/AIDE/sysctl)
+```
+
+| Flag | Purpose |
+|------|---------|
+| `--admin-key "KEY"` / `--admin-key-file PATH` | Install an SSH **public** key for the admin user (never generates private keys on the box). |
+| `--user NAME` | Create/use a non-root sudo user. |
+| `--ssh-port N` | Set the SSH port. |
+| `--yes`, `-y` | Non-interactive; safe defaults. Won't disable password auth unless a key is supplied, nor disable root login unless a user/key is supplied. |
+| `--audit` | Run the read-only [`vps-audit`](https://github.com/latetedemelon/vps-audit) companion and exit. |
+| `--cis` | Apply the optional, non-fatal CIS baseline. |
+| `--ignore-audit-failures` | Don't halt on a failed critical audit check. |
+
+**Environment variables:** `AUTHORIZED_KEY` (admin pubkey), `BW_SESSION`
+(Bitwarden vault host-key backup), `BWS_ACCESS_TOKEN` + `BWS_PROJECT_ID`
+(Bitwarden **Secrets Manager** backup).
+
+### Bootstrap an admin key on your own machine
+
+Generate the keypair on a **trusted** workstation, store the private key in
+Bitwarden, and hand only the public key to the server:
+
+```bash
+./bootstrap-admin-key.sh -n admin-myhost   # prints the public key + the exact
+                                            # vps-lockdown.sh command to run next
+```
+
+### Distro support
+
+| Family | Status |
+|--------|--------|
+| Debian / Ubuntu | **Fully supported** (original target) |
+| RHEL / Fedora / Alpine / SUSE / Arch | Experimental — universal steps run; apt/ufw-only steps are replaced by portable equivalents (firewalld/nftables, `useradd`/`wheel`) |
+
+> ⚠️ **Validation:** the automation, Bitwarden, and non-Debian paths currently
+> pass syntax + isolated logic tests only. Validate on a throwaway VM before
+> using in production.
+
 If this script helps you out, please contribute some feedback. Donations are also welcome and help permit me to continue to develop this and other projects.
 
 ```

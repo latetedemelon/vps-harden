@@ -268,15 +268,21 @@ Usage: vps-lockdown.sh [options]
                            admin key is supplied; does NOT disable root login
                            unless a user or key is supplied)
   --audit                  Run the read-only vps-audit companion and exit
+  --cis                    Apply the optional CIS baseline (auditd, AIDE,
+                           password aging, sysctl); non-fatal, opt-in
   --ignore-audit-failures  Do not halt on a failed critical audit check
   -h, --help               Show this help and exit
+
+Environment: AUTHORIZED_KEY, BW_SESSION (vault backup),
+  BWS_ACCESS_TOKEN + BWS_PROJECT_ID (Secrets Manager backup).
+Distros: Debian/Ubuntu fully supported; RHEL/Alpine/SUSE/Arch experimental.
 USAGE
 }
 
 # Parse CLI flags. Unattended automation sets values here; interactive runs use
 # the prompts. Keeps everything optional so a bare run behaves exactly as before.
 function parse_args() {
-    ASSUME_YES="no"; IGNORE_AUDIT_FAILURES="no"; AUDIT_ONLY="no"
+    ASSUME_YES="no"; IGNORE_AUDIT_FAILURES="no"; AUDIT_ONLY="no"; DO_CIS="no"
     SSH_PORT_OPT=""; USER_OPT=""
     while [ $# -gt 0 ]; do
         case "$1" in
@@ -291,12 +297,13 @@ function parse_args() {
             --yes|-y)               ASSUME_YES="yes" ;;
             --ignore-audit-failures|--force-forward) IGNORE_AUDIT_FAILURES="yes" ;;
             --audit)                AUDIT_ONLY="yes" ;;
+            --cis)                  DO_CIS="yes" ;;
             -h|--help)              usage; exit 0 ;;
             *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
         esac
         shift
     done
-    export AUTHORIZED_KEY ASSUME_YES IGNORE_AUDIT_FAILURES AUDIT_ONLY SSH_PORT_OPT USER_OPT
+    export AUTHORIZED_KEY ASSUME_YES IGNORE_AUDIT_FAILURES AUDIT_ONLY DO_CIS SSH_PORT_OPT USER_OPT
 }
 
 # Ask a yes/no question. In --yes (ASSUME_YES) mode, auto-answers with DEFAULT
@@ -372,6 +379,86 @@ function svc_restart() {
 # True only on the fully-supported Debian/Ubuntu family. Used to skip apt/ufw-
 # specific steps cleanly on other distros until their profiles are implemented.
 function is_debian_family() { [ "${DISTRO_FAMILY:-}" = "debian" ]; }
+
+# Open the SSH port using whatever firewall the distro ships (firewalld -> nftables
+# -> iptables). EXPERIMENTAL non-Debian baseline; SSH-only and policy left ACCEPT so
+# a remote run can never lock itself out.
+function firewall_nondebian() {
+    local port="${1:-22}"
+    skip_in_container "firewall (host-managed in container)" && return 0
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        svc_enable firewalld; svc_restart firewalld >/dev/null 2>&1
+        firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+        echo -e " --> firewalld: opened ${port}/tcp." | tee -a "$LOGFILE"
+    elif command -v nft >/dev/null 2>&1; then
+        nft list table inet filter >/dev/null 2>&1 || nft add table inet filter
+        nft 'add chain inet filter input { type filter hook input priority 0 ; policy accept ; }' 2>/dev/null
+        nft add rule inet filter input tcp dport "$port" accept 2>/dev/null
+        echo -e " --> nftables: allowed tcp/${port} (policy left ACCEPT to avoid lockout)." | tee -a "$LOGFILE"
+    elif command -v iptables >/dev/null 2>&1; then
+        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null \
+            || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+        echo -e " --> iptables: allowed tcp/${port} (not persisted - install a persistence pkg)." | tee -a "$LOGFILE"
+    else
+        echo -e " --> No supported firewall tool found; skipping firewall config." | tee -a "$LOGFILE"
+    fi
+}
+
+# Optional CIS-leaning baseline (auditd + AIDE + password-aging + a couple of
+# sysctl). Cross-distro via pkg_install. Opt-in (--cis or prompt) and fully non-
+# fatal so it never blocks a hardening run. EXPERIMENTAL beyond the Debian family.
+function cis_baseline() {
+    local DOCIS="${DO_CIS:-no}"
+    if [ "$DOCIS" != "yes" ]; then
+        ask_yn DOCIS "Apply optional CIS baseline (auditd, AIDE, password aging)? y/n" "n"
+        [ "${DOCIS,,}" = "y" ] && DOCIS="yes" || DOCIS="no"
+    fi
+    [ "$DOCIS" = "yes" ] || { echo -e " --> Skipping optional CIS baseline." | tee -a "$LOGFILE"; return 0; }
+
+    echo -e -n "${lightcyan}"; echo -e "\n --> Applying optional CIS baseline (non-fatal)..." | tee -a "$LOGFILE"; echo -e -n "${nocolor}"
+
+    # auditd package name differs by distro (audit on RHEL/SUSE/Arch/Alpine).
+    local audit_pkg="auditd"
+    case "${DISTRO_FAMILY:-debian}" in rhel|suse|arch|alpine) audit_pkg="audit" ;; esac
+    if ! command -v auditctl >/dev/null 2>&1; then
+        pkg_install "$audit_pkg" >/dev/null 2>>"$LOGFILE" \
+            && echo -e " --> installed $audit_pkg." | tee -a "$LOGFILE" \
+            || echo -e " --> could not install $audit_pkg (skip)." | tee -a "$LOGFILE"
+    fi
+    if ! skip_in_container "auditd enable"; then svc_enable auditd; svc_restart auditd >/dev/null 2>&1; fi
+
+    # AIDE file-integrity baseline (best-effort; init can be slow, so only if absent).
+    if ! command -v aide >/dev/null 2>&1; then
+        pkg_install aide >/dev/null 2>>"$LOGFILE" \
+            && echo -e " --> installed aide." | tee -a "$LOGFILE" \
+            || echo -e " --> could not install aide (skip)." | tee -a "$LOGFILE"
+    fi
+
+    # Password aging defaults in /etc/login.defs (idempotent).
+    if [ -f /etc/login.defs ]; then
+        change_record /etc/login.defs
+        sed -i -E 's/^#?\s*(PASS_MAX_DAYS)\s+.*/\1   365/' /etc/login.defs 2>/dev/null || true
+        sed -i -E 's/^#?\s*(PASS_MIN_DAYS)\s+.*/\1   1/'   /etc/login.defs 2>/dev/null || true
+        sed -i -E 's/^#?\s*(PASS_WARN_AGE)\s+.*/\1   7/'   /etc/login.defs 2>/dev/null || true
+        echo -e " --> tuned password aging in /etc/login.defs." | tee -a "$LOGFILE"
+    fi
+
+    # A couple of universally-safe sysctl items (skipped in containers).
+    if ! skip_in_container "CIS sysctl"; then
+        local cf=/etc/sysctl.d/99-cis-baseline.conf
+        change_record "$cf"
+        {
+            echo "kernel.randomize_va_space = 2"
+            echo "fs.suid_dumpable = 0"
+            echo "net.ipv4.conf.all.rp_filter = 1"
+        } > "$cf" 2>/dev/null && sysctl --system >/dev/null 2>&1 \
+            && echo -e " --> wrote $cf and reloaded sysctl." | tee -a "$LOGFILE" \
+            || echo -e " --> could not apply CIS sysctl (skip)." | tee -a "$LOGFILE"
+    fi
+
+    echo -e -n "${lightgreen}"; echo -e " --> CIS baseline step complete." | tee -a "$LOGFILE"; echo -e -n "${nocolor}"
+}
 
 #########################
 ## CHECK & CREATE SWAP ##
@@ -656,8 +743,30 @@ function add_user() {
             echo -e -n "${cyan}"
             echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
             echo -e -n "${nocolor}"
-            adduser --gecos "" "${UNAME,,}" | tee -a "$LOGFILE"
-            usermod -aG sudo "${UNAME,,}" | tee -a "$LOGFILE"
+            # Portable user creation + admin group across distro families.
+            # Debian/Ubuntu sudo group; RHEL/SUSE/Arch/Alpine use 'wheel'.
+            local _u="${UNAME,,}" _grp="sudo"
+            case "${DISTRO_FAMILY:-debian}" in rhel|suse|arch|alpine) _grp="wheel" ;; esac
+            if is_debian_family && command -v adduser >/dev/null 2>&1; then
+                adduser --gecos "" "$_u" | tee -a "$LOGFILE"
+            elif command -v useradd >/dev/null 2>&1; then
+                useradd -m -s /bin/bash "$_u" 2>&1 | tee -a "$LOGFILE"
+                echo -e " --> Set a password for $_u:" ; passwd "$_u"
+                # ensure 'sudo' is available and the wheel group is permitted
+                command -v sudo >/dev/null 2>&1 || pkg_install sudo >/dev/null 2>&1 || true
+                if [ -f /etc/sudoers ] && ! grep -Eq '^[[:space:]]*%wheel[[:space:]]+ALL=\(ALL' /etc/sudoers; then
+                    sed -i 's/^#\s*\(%wheel\s\+ALL=(ALL)\?\s*ALL\)/\1/' /etc/sudoers 2>/dev/null || true
+                fi
+            elif command -v adduser >/dev/null 2>&1; then   # busybox (Alpine)
+                adduser -D -s /bin/sh "$_u" 2>&1 | tee -a "$LOGFILE"
+                echo -e " --> Set a password for $_u:" ; passwd "$_u"
+                command -v sudo >/dev/null 2>&1 || pkg_install sudo >/dev/null 2>&1 || true
+            fi
+            if command -v usermod >/dev/null 2>&1; then
+                usermod -aG "$_grp" "$_u" | tee -a "$LOGFILE"
+            elif command -v addgroup >/dev/null 2>&1; then   # busybox
+                addgroup "$_u" "$_grp" 2>&1 | tee -a "$LOGFILE"
+            fi
             echo -e -n "${lightgreen}"
             echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
             echo " $(date +%m.%d.%Y_%H:%M:%S) : SUCCESS : '${UNAME,,}' added to SUDO group" | tee -a "$LOGFILE"
@@ -1045,7 +1154,12 @@ function disable_passauth() {
 ################
 
 function ufw_config() {
-    if ! is_debian_family; then echo -e "${yellow} --> Skipping UFW config on non-Debian distro (use the host/distro firewall).${nocolor}" | tee -a "$LOGFILE"; FIREWALLP="n"; return 0; fi
+    if ! is_debian_family; then
+        echo -e "${yellow} --> Non-Debian distro: applying portable firewall baseline instead of UFW.${nocolor}" | tee -a "$LOGFILE"
+        firewall_nondebian "${SSHPORT:-22}"
+        FIREWALLP="n"
+        return 0
+    fi
     # query user to disable password authentication or not
     echo -e -n "${lightcyan}"
     figlet Firewall Config | tee -a "$LOGFILE"
@@ -1874,6 +1988,7 @@ prompt_rootlogin
 disable_passauth
 ufw_config
 server_hardening
+cis_baseline
 google_auth
 ksplice_install
 motd_install

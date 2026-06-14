@@ -1,13 +1,30 @@
 # VPS Hardening Suite — Design & Implementation Plan
 
-Status: **Phases 1–5 complete + Phase 6 foundation** — container guard, per-step
-backout, `install_admin_key()`, optional `bitwarden_backup()` (vault + Secrets
-Manager), the `vps-audit` audit gate, a non-interactive CLI flag parser, the
-`bootstrap-admin-key.sh` helper, and a distro/package/service abstraction are in
-place (with the `vps-audit --json` companion in
-[vps-audit#3](https://github.com/latetedemelon/vps-audit/pull/3)). Remaining:
-full RHEL/Alpine package+firewall profiles and CIS-depth controls (Phase 6
-continuation), and docs (Phase 7).
+Status: **Phases 1–7 implemented (pending real-host validation)** — container
+guard, per-step backout, `install_admin_key()`, optional `bitwarden_backup()`
+(vault + Secrets Manager), the `vps-audit` audit gate, a non-interactive CLI flag
+parser, the `bootstrap-admin-key.sh` helper, a distro/package/service abstraction
+with portable user creation + firewall (firewalld/nftables/iptables), an optional
+`--cis` baseline (auditd/AIDE/login.defs/sysctl), and docs are all in place (with
+the `vps-audit --json` companion in
+[vps-audit#3](https://github.com/latetedemelon/vps-audit/pull/3)).
+
+> ⚠️ **Validation status:** everything past Phase 1 is verified only by `bash -n`
+> and isolated unit-style tests. **No end-to-end run on any real VM has happened**
+> — the non-Debian (RHEL/Alpine/SUSE/Arch) paths in particular are written but
+> entirely unexercised. Oracle free-tier testing is **blocked**: no OCI
+> credentials or `oci`/`terraform` CLI are present in the build environment, so
+> instances cannot be provisioned from here (see "Testing" below).
+
+### Distro support matrix
+
+| Family | Package mgr | Status | Firewall | Notes |
+|---|---|---|---|---|
+| Debian / Ubuntu | apt | **Supported** | UFW | full path; the original target |
+| RHEL / Fedora / CentOS | dnf/yum | Experimental | firewalld | apt steps skip; useradd+wheel |
+| Alpine | apk | Experimental | nftables/iptables | busybox adduser; OpenRC services |
+| SUSE | zypper | Experimental | firewalld | useradd+wheel |
+| Arch | pacman | Experimental | nftables/iptables | useradd+wheel |
 Target script: `vps-lockdown.sh` (+ `vps-audit.sh` as the verification companion)
 Branch: `claude/ssh-key-hardening-bitwarden-QqjuH`
 
@@ -284,9 +301,21 @@ shippable. Nothing here is dropped; later phases are simply later.
 > `sshd`/`ssh`), and `is_debian_family()`. apt/ufw-specific steps (updates,
 > package installs, UFW, unattended-upgrades) now **skip cleanly on non-Debian**
 > rather than erroring; universal steps (user, SSH config, backout, audit,
-> service restart) run everywhere. **Still to do:** real RHEL/Alpine package +
-> firewall (firewalld/nftables) profiles, `adduser`→`useradd` portability, and
-> CIS-depth controls (auditd/AppArmor/sysctl/AIDE). Phase 7 = docs.
+> service restart) run everywhere.
+>
+> **Phase 6 (continuation)** completes the cross-distro work: portable user
+> creation (`adduser` → `useradd`/busybox `adduser`, `sudo`→`wheel` group with
+> sudoers enablement), a portable firewall baseline `firewall_nondebian()`
+> (firewalld → nftables → iptables, SSH-only, policy left ACCEPT to avoid
+> lockout), and an optional `cis_baseline()` (`--cis` flag or prompt) installing
+> auditd + AIDE and applying password-aging (`/etc/login.defs`) plus a small
+> CIS sysctl set — all non-fatal and container-aware.
+>
+> **Phase 7 (docs)** adds this status block + distro matrix, the env-var/flag
+> reference in `--help`, and the README usage section.
+>
+> ⚠️ The non-Debian paths and `--cis` are **unvalidated on real distros** — they
+> pass `bash -n` and isolated logic tests only.
 
 1. **Phase 1 — Per-step backout foundation (§7.1) + container guard.** A
    `change_record` + per-step `trap`-revert helper so every subsequent mutating
