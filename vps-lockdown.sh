@@ -87,18 +87,33 @@ function setup_environment() {
 }
 
 function check_distro() {
-    # currently only for Ubuntu 16.04
+    # Classify the distro family (priority: Debian -> Red Hat -> Alpine) and pick
+    # the package manager. Debian family is fully supported; others are EXPERIMENTAL.
     if [[ -r /etc/os-release ]]; then
         . /etc/os-release
-        if [[ "${VERSION_ID}" != "16.04" ]] ; then
-            echo -e "\nThis script works the very best with Ubuntu 16.04 LTS."
-            echo -e "Some elements of this script won't work correctly on other releases.\n"
-        fi
+        case " ${ID_LIKE:-} ${ID:-} " in
+            *debian*|*ubuntu*)        DISTRO_FAMILY="debian" ;;
+            *rhel*|*fedora*|*centos*) DISTRO_FAMILY="rhel" ;;
+            *alpine*)                 DISTRO_FAMILY="alpine" ;;
+            *suse*)                   DISTRO_FAMILY="suse" ;;
+            *arch*)                   DISTRO_FAMILY="arch" ;;
+            *)                        DISTRO_FAMILY="unknown" ;;
+        esac
     else
-        # no, thats not ok!
-        echo -e "This script only supports Ubuntu 16.04, exiting.\n"
+        echo -e "Cannot read /etc/os-release; unsupported system, exiting.\n"
         exit 1
     fi
+    detect_pkg_mgr
+    export DISTRO_FAMILY
+    case "$DISTRO_FAMILY" in
+        debian) : ;;  # fully supported
+        rhel|alpine|suse|arch)
+            echo -e "\n'$DISTRO_FAMILY' family detected ($PKG_MGR) - EXPERIMENTAL."
+            echo -e "Universal steps run; apt/ufw-specific hardening is skipped until"
+            echo -e "this distro's profile is implemented.\n" ;;
+        *)
+            echo -e "\nUnrecognized distro - EXPERIMENTAL; proceeding with universal steps only.\n" ;;
+    esac
 }
 
 function begin_log() {
@@ -111,6 +126,338 @@ function begin_log() {
     echo -e "---------------------------------------------------- \n" | tee -a "$LOGFILE"
     echo -e -n "${nocolor}"
     sleep 2
+}
+
+############################################
+## BACKOUT & CONTAINER DETECTION (Phase 1) ##
+############################################
+# Foundation that everything else builds on:
+#  - Container awareness: host-managed steps (swap, sysctl, firewall, ksplice)
+#    are skipped inside LXC/Docker where they are blocked or meaningless, so the
+#    script runs safely on both VMs and containers.
+#  - Per-step backout: every mutating step records what it touches; if that step
+#    fails it reverts ONLY itself, leaving SSH and the rest of the system intact.
+#    A manifest is written for auditability and manual recovery.
+
+# Detect once whether we are running inside a container.
+function detect_container() {
+    IS_CONTAINER="no"
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+        systemd-detect-virt --container --quiet && IS_CONTAINER="yes"
+    fi
+    if [ "$IS_CONTAINER" = "no" ]; then
+        if [ -f /run/systemd/container ] || [ -f /.dockerenv ]; then
+            IS_CONTAINER="yes"
+        elif grep -qaE '(lxc|docker|containerd|kubepods)' /proc/1/cgroup 2>/dev/null; then
+            IS_CONTAINER="yes"
+        elif [ -n "${container:-}" ]; then
+            IS_CONTAINER="yes"
+        fi
+    fi
+    if [ "$IS_CONTAINER" = "yes" ]; then
+        echo -e -n "${yellow}"
+        echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
+        echo -e " $(date +%m.%d.%Y_%H:%M:%S) : Container detected (LXC/Docker)" | tee -a "$LOGFILE"
+        echo -e " Host-managed steps (swap, sysctl, firewall, ksplice) will be skipped." | tee -a "$LOGFILE"
+        echo -e "---------------------------------------------------- \n" | tee -a "$LOGFILE"
+        echo -e -n "${nocolor}"
+        sleep 1
+    fi
+}
+
+# Return 0 (and log) when a host-managed step should be skipped in a container.
+function skip_in_container() {
+    local label="$1"
+    if [ "${IS_CONTAINER:-no}" = "yes" ]; then
+        echo -e -n "${yellow}"
+        echo -e " --> Skipping '$label' inside container (host-managed). " | tee -a "$LOGFILE"
+        echo -e -n "${nocolor}"
+        return 0
+    fi
+    return 1
+}
+
+# Initialise the per-run backout manifest.
+function init_backout() {
+    BACKUP_ROOT="/var/backups/vps-harden"
+    RUN_ID="$(date +%Y%m%d-%H%M%S)-$$"
+    RUN_DIR="$BACKUP_ROOT/$RUN_ID"
+    MANIFEST="$RUN_DIR/manifest"
+    mkdir -p "$RUN_DIR"
+    chmod 700 "$BACKUP_ROOT" "$RUN_DIR" 2>/dev/null
+    : > "$MANIFEST"
+    echo "# vps-lockdown backout manifest - run $RUN_ID - $(date)" >> "$MANIFEST"
+    echo -e -n "${white}"
+    echo -e " $(date +%m.%d.%Y_%H:%M:%S) : Backout manifest at $MANIFEST" | tee -a "$LOGFILE"
+    echo -e -n "${nocolor}"
+}
+
+# Begin a named, individually-revertable step.
+function step_begin() {
+    CURRENT_STEP="$1"
+    STEP_BACKUPS=()
+    STEP_INVERSES=()
+    echo "STEP $CURRENT_STEP $(date +%s)" >> "$MANIFEST"
+}
+
+# Back up a file before it is modified (records ABSENT if it does not yet exist).
+function change_record() {
+    local path="$1" stamp safe backup
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    safe="$(echo "$path" | sed 's#/#_#g')"
+    backup="$RUN_DIR/${safe}.${stamp}.bak"
+    if [ -e "$path" ]; then
+        cp -a "$path" "$backup"
+        STEP_BACKUPS+=("$path|$backup")
+        echo "FILE $path $backup" >> "$MANIFEST"
+    else
+        STEP_BACKUPS+=("$path|")   # empty backup => file was absent; revert deletes it
+        echo "ABSENT $path" >> "$MANIFEST"
+    fi
+}
+
+# Record an inverse command to undo a non-file change (e.g. 'ufw disable').
+function record_inverse() {
+    STEP_INVERSES+=("$*")
+    echo "CMD $*" >> "$MANIFEST"
+}
+
+# Revert ONLY the current step: undo inverse commands, then restore/delete files.
+function step_revert() {
+    echo -e -n "${lightred}"
+    echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
+    echo -e " $(date +%m.%d.%Y_%H:%M:%S) : Step '$CURRENT_STEP' failed - reverting this step only" | tee -a "$LOGFILE"
+    echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
+    echo -e -n "${nocolor}"
+    local i entry path backup
+    for (( i=${#STEP_INVERSES[@]}-1; i>=0; i-- )); do
+        eval "${STEP_INVERSES[$i]}" >> "$LOGFILE" 2>&1 || true
+    done
+    for (( i=${#STEP_BACKUPS[@]}-1; i>=0; i-- )); do
+        entry="${STEP_BACKUPS[$i]}"
+        path="${entry%%|*}"
+        backup="${entry#*|}"
+        if [ -n "$backup" ] && [ -e "$backup" ]; then
+            cp -a "$backup" "$path"
+        elif [ -z "$backup" ]; then
+            rm -f "$path"
+        fi
+    done
+    echo "REVERTED $CURRENT_STEP $(date +%s)" >> "$MANIFEST"
+}
+
+# Mark the current step as successfully committed.
+function step_commit() {
+    echo "COMMIT $CURRENT_STEP $(date +%s)" >> "$MANIFEST"
+}
+
+############################################
+## CLI ARGS & NON-INTERACTIVE MODE (Ph 5) ##
+############################################
+
+function usage() {
+    cat <<USAGE
+Usage: vps-lockdown.sh [options]
+
+  --admin-key "KEY"        Install this SSH PUBLIC key for the admin user
+  --admin-key-file PATH    Read the admin public key from a file
+  --ssh-port N             Use SSH port N (else prompt / keep 22)
+  --user NAME              Create/!use this non-root sudo user
+  --yes, -y                Non-interactive: auto-answer prompts with safe
+                           defaults (does NOT disable password auth unless an
+                           admin key is supplied; does NOT disable root login
+                           unless a user or key is supplied)
+  --audit                  Run the read-only vps-audit companion and exit
+  --cis                    Apply the optional CIS baseline (auditd, AIDE,
+                           password aging, sysctl); non-fatal, opt-in
+  --ignore-audit-failures  Do not halt on a failed critical audit check
+  -h, --help               Show this help and exit
+
+Environment: AUTHORIZED_KEY, BW_SESSION (vault backup),
+  BWS_ACCESS_TOKEN + BWS_PROJECT_ID (Secrets Manager backup).
+Distros: Debian/Ubuntu fully supported; RHEL/Alpine/SUSE/Arch experimental.
+USAGE
+}
+
+# Parse CLI flags. Unattended automation sets values here; interactive runs use
+# the prompts. Keeps everything optional so a bare run behaves exactly as before.
+function parse_args() {
+    ASSUME_YES="no"; IGNORE_AUDIT_FAILURES="no"; AUDIT_ONLY="no"; DO_CIS="no"
+    SSH_PORT_OPT=""; USER_OPT=""
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --admin-key)            shift; AUTHORIZED_KEY="$1" ;;
+            --admin-key=*)          AUTHORIZED_KEY="${1#*=}" ;;
+            --admin-key-file)       shift; AUTHORIZED_KEY="$(cat "$1" 2>/dev/null)" ;;
+            --admin-key-file=*)     AUTHORIZED_KEY="$(cat "${1#*=}" 2>/dev/null)" ;;
+            --ssh-port)             shift; SSH_PORT_OPT="$1" ;;
+            --ssh-port=*)           SSH_PORT_OPT="${1#*=}" ;;
+            --user)                 shift; USER_OPT="$1" ;;
+            --user=*)               USER_OPT="${1#*=}" ;;
+            --yes|-y)               ASSUME_YES="yes" ;;
+            --ignore-audit-failures|--force-forward) IGNORE_AUDIT_FAILURES="yes" ;;
+            --audit)                AUDIT_ONLY="yes" ;;
+            --cis)                  DO_CIS="yes" ;;
+            -h|--help)              usage; exit 0 ;;
+            *) echo "Unknown option: $1" >&2; usage; exit 1 ;;
+        esac
+        shift
+    done
+    export AUTHORIZED_KEY ASSUME_YES IGNORE_AUDIT_FAILURES AUDIT_ONLY DO_CIS SSH_PORT_OPT USER_OPT
+}
+
+# Ask a yes/no question. In --yes (ASSUME_YES) mode, auto-answers with DEFAULT
+# instead of blocking on input. Usage: ask_yn VARNAME "prompt ... y/n" DEFAULT
+function ask_yn() {
+    local __var="$1" __prompt="$2" __def="$3" __ans=""
+    if [ "${ASSUME_YES:-no}" = "yes" ]; then
+        __ans="$__def"
+        echo -e "${cyan} $__prompt -> ${__def} (non-interactive)${nocolor}" | tee -a "$LOGFILE"
+    else
+        while :; do
+            echo -e "\n"
+            read -n 1 -s -r -p " $__prompt " __ans
+            [[ ${__ans,,} == "y" || ${__ans,,} == "n" ]] && break
+        done
+    fi
+    printf -v "$__var" '%s' "$__ans"
+}
+
+############################################
+## DISTRO / PACKAGE / SERVICE ABSTRACTION ##
+############################################
+# Phase 6 foundation: detect the package manager + init system so the suite can
+# run beyond Ubuntu (priority Debian -> Red Hat -> Alpine). The Debian family is
+# fully supported today; on other families the universal steps (user, SSH config,
+# backout, audit, service restart) run and apt/ufw-specific steps are skipped.
+# Full per-distro package/firewall/CIS profiles are the next increment.
+
+function detect_pkg_mgr() {
+    if command -v apt-get >/dev/null 2>&1; then PKG_MGR="apt"
+    elif command -v dnf >/dev/null 2>&1; then PKG_MGR="dnf"
+    elif command -v yum >/dev/null 2>&1; then PKG_MGR="yum"
+    elif command -v zypper >/dev/null 2>&1; then PKG_MGR="zypper"
+    elif command -v pacman >/dev/null 2>&1; then PKG_MGR="pacman"
+    elif command -v apk >/dev/null 2>&1; then PKG_MGR="apk"
+    else PKG_MGR="unknown"; fi
+    export PKG_MGR
+}
+
+function pkg_install() {
+    case "${PKG_MGR:-unknown}" in
+        apt)    DEBIAN_FRONTEND=noninteractive apt-get install -y "$@" ;;
+        dnf)    dnf install -y "$@" ;;
+        yum)    yum install -y "$@" ;;
+        zypper) zypper --non-interactive install "$@" ;;
+        pacman) pacman -S --noconfirm "$@" ;;
+        apk)    apk add "$@" ;;
+        *) return 1 ;;
+    esac
+}
+
+function svc_enable() {
+    if command -v systemctl >/dev/null 2>&1; then systemctl enable "$1" >/dev/null 2>&1
+    elif command -v rc-update >/dev/null 2>&1; then rc-update add "$1" >/dev/null 2>&1
+    fi
+}
+
+# Restart the first service name that exists (e.g. svc_restart sshd ssh).
+function svc_restart() {
+    local s
+    for s in "$@"; do
+        if command -v systemctl >/dev/null 2>&1; then
+            systemctl restart "$s" >/dev/null 2>&1 && return 0
+        elif command -v rc-service >/dev/null 2>&1; then
+            rc-service "$s" restart >/dev/null 2>&1 && return 0
+        elif command -v service >/dev/null 2>&1; then
+            service "$s" restart >/dev/null 2>&1 && return 0
+        fi
+    done
+    return 1
+}
+
+# True only on the fully-supported Debian/Ubuntu family. Used to skip apt/ufw-
+# specific steps cleanly on other distros until their profiles are implemented.
+function is_debian_family() { [ "${DISTRO_FAMILY:-}" = "debian" ]; }
+
+# Open the SSH port using whatever firewall the distro ships (firewalld -> nftables
+# -> iptables). EXPERIMENTAL non-Debian baseline; SSH-only and policy left ACCEPT so
+# a remote run can never lock itself out.
+function firewall_nondebian() {
+    local port="${1:-22}"
+    skip_in_container "firewall (host-managed in container)" && return 0
+    if command -v firewall-cmd >/dev/null 2>&1; then
+        svc_enable firewalld; svc_restart firewalld >/dev/null 2>&1
+        firewall-cmd --permanent --add-port="${port}/tcp" >/dev/null 2>&1
+        firewall-cmd --reload >/dev/null 2>&1
+        echo -e " --> firewalld: opened ${port}/tcp." | tee -a "$LOGFILE"
+    elif command -v nft >/dev/null 2>&1; then
+        nft list table inet filter >/dev/null 2>&1 || nft add table inet filter
+        nft 'add chain inet filter input { type filter hook input priority 0 ; policy accept ; }' 2>/dev/null
+        nft add rule inet filter input tcp dport "$port" accept 2>/dev/null
+        echo -e " --> nftables: allowed tcp/${port} (policy left ACCEPT to avoid lockout)." | tee -a "$LOGFILE"
+    elif command -v iptables >/dev/null 2>&1; then
+        iptables -C INPUT -p tcp --dport "$port" -j ACCEPT 2>/dev/null \
+            || iptables -I INPUT -p tcp --dport "$port" -j ACCEPT
+        echo -e " --> iptables: allowed tcp/${port} (not persisted - install a persistence pkg)." | tee -a "$LOGFILE"
+    else
+        echo -e " --> No supported firewall tool found; skipping firewall config." | tee -a "$LOGFILE"
+    fi
+}
+
+# Optional CIS-leaning baseline (auditd + AIDE + password-aging + a couple of
+# sysctl). Cross-distro via pkg_install. Opt-in (--cis or prompt) and fully non-
+# fatal so it never blocks a hardening run. EXPERIMENTAL beyond the Debian family.
+function cis_baseline() {
+    local DOCIS="${DO_CIS:-no}"
+    if [ "$DOCIS" != "yes" ]; then
+        ask_yn DOCIS "Apply optional CIS baseline (auditd, AIDE, password aging)? y/n" "n"
+        [ "${DOCIS,,}" = "y" ] && DOCIS="yes" || DOCIS="no"
+    fi
+    [ "$DOCIS" = "yes" ] || { echo -e " --> Skipping optional CIS baseline." | tee -a "$LOGFILE"; return 0; }
+
+    echo -e -n "${lightcyan}"; echo -e "\n --> Applying optional CIS baseline (non-fatal)..." | tee -a "$LOGFILE"; echo -e -n "${nocolor}"
+
+    # auditd package name differs by distro (audit on RHEL/SUSE/Arch/Alpine).
+    local audit_pkg="auditd"
+    case "${DISTRO_FAMILY:-debian}" in rhel|suse|arch|alpine) audit_pkg="audit" ;; esac
+    if ! command -v auditctl >/dev/null 2>&1; then
+        pkg_install "$audit_pkg" >/dev/null 2>>"$LOGFILE" \
+            && echo -e " --> installed $audit_pkg." | tee -a "$LOGFILE" \
+            || echo -e " --> could not install $audit_pkg (skip)." | tee -a "$LOGFILE"
+    fi
+    if ! skip_in_container "auditd enable"; then svc_enable auditd; svc_restart auditd >/dev/null 2>&1; fi
+
+    # AIDE file-integrity baseline (best-effort; init can be slow, so only if absent).
+    if ! command -v aide >/dev/null 2>&1; then
+        pkg_install aide >/dev/null 2>>"$LOGFILE" \
+            && echo -e " --> installed aide." | tee -a "$LOGFILE" \
+            || echo -e " --> could not install aide (skip)." | tee -a "$LOGFILE"
+    fi
+
+    # Password aging defaults in /etc/login.defs (idempotent).
+    if [ -f /etc/login.defs ]; then
+        change_record /etc/login.defs
+        sed -i -E 's/^#?\s*(PASS_MAX_DAYS)\s+.*/\1   365/' /etc/login.defs 2>/dev/null || true
+        sed -i -E 's/^#?\s*(PASS_MIN_DAYS)\s+.*/\1   1/'   /etc/login.defs 2>/dev/null || true
+        sed -i -E 's/^#?\s*(PASS_WARN_AGE)\s+.*/\1   7/'   /etc/login.defs 2>/dev/null || true
+        echo -e " --> tuned password aging in /etc/login.defs." | tee -a "$LOGFILE"
+    fi
+
+    # A couple of universally-safe sysctl items (skipped in containers).
+    if ! skip_in_container "CIS sysctl"; then
+        local cf=/etc/sysctl.d/99-cis-baseline.conf
+        change_record "$cf"
+        {
+            echo "kernel.randomize_va_space = 2"
+            echo "fs.suid_dumpable = 0"
+            echo "net.ipv4.conf.all.rp_filter = 1"
+        } > "$cf" 2>/dev/null && sysctl --system >/dev/null 2>&1 \
+            && echo -e " --> wrote $cf and reloaded sysctl." | tee -a "$LOGFILE" \
+            || echo -e " --> could not apply CIS sysctl (skip)." | tee -a "$LOGFILE"
+    fi
+
+    echo -e -n "${lightgreen}"; echo -e " --> CIS baseline step complete." | tee -a "$LOGFILE"; echo -e -n "${nocolor}"
 }
 
 #########################
@@ -127,6 +474,9 @@ function create_swap() {
     echo -e "------------------------------------------------- \n" | tee -a "$LOGFILE"
     echo -e -n "${white}"
 
+    # Swap is host-managed inside containers (swapon is blocked) - skip there.
+    if skip_in_container "swap creation"; then return; fi
+
     # Check for swap file - if none, create one
     if free | awk '/^Swap:/ {exit !$2}'; then
         echo -e -n "${lightred}"
@@ -142,14 +492,26 @@ function create_swap() {
         (($SWAPSIZE >= 1 && $SWAPSIZE >= 31)) && SWAPSIZE=31
         (($SWAPSIZE <= 2)) && SWAPSIZE=2
 
-        fallocate -l ${SWAPSIZE}G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile && cp /etc/fstab /etc/fstab.bak && echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
-        echo -e -n "${lightgreen}"
-        echo -e "-------------------------------------------------- " | tee -a "$LOGFILE"
-        echo -e " $(date +%m.%d.%Y_%H:%M:%S) : SWAP CREATED SUCCESSFULLY " | tee -a "$LOGFILE"
-        echo -e "--> Thanks @Cryptotron for supplying swap code <-- "
-        echo -e "-------------------------------------------------- \n" | tee -a "$LOGFILE"
-        sleep 2
-        echo -e -n "${nocolor}"
+        step_begin "create_swap"
+        change_record /etc/fstab
+        if fallocate -l ${SWAPSIZE}G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile; then
+            record_inverse "swapoff /swapfile 2>/dev/null; rm -f /swapfile"
+            cp /etc/fstab /etc/fstab.bak && echo '/swapfile none swap sw 0 0' | tee -a /etc/fstab
+            step_commit
+            echo -e -n "${lightgreen}"
+            echo -e "-------------------------------------------------- " | tee -a "$LOGFILE"
+            echo -e " $(date +%m.%d.%Y_%H:%M:%S) : SWAP CREATED SUCCESSFULLY " | tee -a "$LOGFILE"
+            echo -e "--> Thanks @Cryptotron for supplying swap code <-- "
+            echo -e "-------------------------------------------------- \n" | tee -a "$LOGFILE"
+            sleep 2
+            echo -e -n "${nocolor}"
+        else
+            step_revert
+            echo -e -n "${lightred}"
+            echo -e " $(date +%m.%d.%Y_%H:%M:%S) : Swap creation failed - skipped, no changes kept" | tee -a "$LOGFILE"
+            echo -e -n "${nocolor}"
+            sleep 2
+        fi
     fi
 }
 
@@ -158,6 +520,7 @@ function create_swap() {
 ######################
 
 function update_upgrade() {
+    if ! is_debian_family; then echo -e "${yellow} --> Skipping apt update/upgrade on non-Debian distro.${nocolor}" | tee -a "$LOGFILE"; return 0; fi
 
     # NOTE I learned the hard way that you must put a "\" BEFORE characters "\" and "`"
     echo -e -n "${lightcyan}"
@@ -220,6 +583,7 @@ function update_upgrade() {
 #
 
 function favored_packages() {
+    if ! is_debian_family; then echo -e "${yellow} --> Skipping apt package install on non-Debian distro.${nocolor}" | tee -a "$LOGFILE"; return 0; fi
     # install my favorite and commonly used packages
     echo -e -n "${lightcyan}"
     figlet Install Favored | tee -a "$LOGFILE"
@@ -249,6 +613,7 @@ function favored_packages() {
 ## CRYPTO PACKAGES ##
 #####################
 function crypto_packages() {
+    if ! is_debian_family; then echo -e "${yellow} --> Skipping apt crypto-package install on non-Debian distro.${nocolor}" | tee -a "$LOGFILE"; return 0; fi
     echo -e -n "${lightcyan}"
     figlet Crypto Setup | tee -a "$LOGFILE"
     echo -e -n "${yellow}"
@@ -263,14 +628,7 @@ function crypto_packages() {
     echo -e "\n"
 
         echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to install these crypto packages now? y/n  " INSTALLCRYPTO
-            if [[ ${INSTALLCRYPTO,,} == "y" || ${INSTALLCRYPTO,,} == "Y" || ${INSTALLCRYPTO,,} == "N" || ${INSTALLCRYPTO,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            ask_yn INSTALLCRYPTO "Would you like to install these crypto packages now? y/n" "n"
         echo -e "${nocolor}"
 
     # check if INSTALLCRYPTO is valid
@@ -351,14 +709,7 @@ function add_user() {
     echo -e " non-root user if you want me to, but it is not required. \n"
     
             echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to add a non-root user? y/n  " ADDUSER
-            if [[ ${ADDUSER,,} == "y" || ${ADDUSER,,} == "Y" || ${ADDUSER,,} == "N" || ${ADDUSER,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            if [ -n "${USER_OPT:-}" ]; then ADDUSER="y"; else ask_yn ADDUSER "Would you like to add a non-root user? y/n" "n"; fi
         echo -e "${nocolor}"
 
     # check if ADDUSER is valid
@@ -367,12 +718,14 @@ function add_user() {
         echo -e -n "${yellow}"
         echo -e " Great; let's set one up now... \n"
         echo -e -n "${cyan}"
+        if [ -n "${USER_OPT:-}" ]; then UNAME="$USER_OPT"; else
         read -p " Enter New Username: " UNAME
         while [[ "$UNAME" =~ [^0-9A-Za-z]+ ]] || [ -z "$UNAME" ]; do echo -e "\n"
             echo -e -n "${lightred}"
             read -p " --> Please enter a username that contains only letters or numbers: " UNAME
             echo -e -n "${nocolor}"
         done
+        fi
         echo -e "\n"
         echo -e -n "${yellow}"
         echo  -e " User elected to create a new user named ${UNAME,,}. \n" >> $LOGFILE 2>&1
@@ -390,14 +743,41 @@ function add_user() {
             echo -e -n "${cyan}"
             echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
             echo -e -n "${nocolor}"
-            adduser --gecos "" "${UNAME,,}" | tee -a "$LOGFILE"
-            usermod -aG sudo "${UNAME,,}" | tee -a "$LOGFILE"
+            # Portable user creation + admin group across distro families.
+            # Debian/Ubuntu sudo group; RHEL/SUSE/Arch/Alpine use 'wheel'.
+            local _u="${UNAME,,}" _grp="sudo"
+            case "${DISTRO_FAMILY:-debian}" in rhel|suse|arch|alpine) _grp="wheel" ;; esac
+            if is_debian_family && command -v adduser >/dev/null 2>&1; then
+                adduser --gecos "" "$_u" | tee -a "$LOGFILE"
+            elif command -v useradd >/dev/null 2>&1; then
+                useradd -m -s /bin/bash "$_u" 2>&1 | tee -a "$LOGFILE"
+                echo -e " --> Set a password for $_u:" ; passwd "$_u"
+                # ensure 'sudo' is available and the wheel group is permitted
+                command -v sudo >/dev/null 2>&1 || pkg_install sudo >/dev/null 2>&1 || true
+                if [ -f /etc/sudoers ] && ! grep -Eq '^[[:space:]]*%wheel[[:space:]]+ALL=\(ALL' /etc/sudoers; then
+                    sed -i 's/^#\s*\(%wheel\s\+ALL=(ALL)\?\s*ALL\)/\1/' /etc/sudoers 2>/dev/null || true
+                fi
+            elif command -v adduser >/dev/null 2>&1; then   # busybox (Alpine)
+                adduser -D -s /bin/sh "$_u" 2>&1 | tee -a "$LOGFILE"
+                echo -e " --> Set a password for $_u:" ; passwd "$_u"
+                command -v sudo >/dev/null 2>&1 || pkg_install sudo >/dev/null 2>&1 || true
+            fi
+            if command -v usermod >/dev/null 2>&1; then
+                usermod -aG "$_grp" "$_u" | tee -a "$LOGFILE"
+            elif command -v addgroup >/dev/null 2>&1; then   # busybox
+                addgroup "$_u" "$_grp" 2>&1 | tee -a "$LOGFILE"
+            fi
             echo -e -n "${lightgreen}"
             echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
             echo " $(date +%m.%d.%Y_%H:%M:%S) : SUCCESS : '${UNAME,,}' added to SUDO group" | tee -a "$LOGFILE"
             echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
-            # copy SSH keys if they exist
-            if [ -e /root/.ssh/authorized_keys ]
+            # copy SSH keys (FALLBACK only): when an admin public key is supplied
+            # via AUTHORIZED_KEY, install_admin_key() places it and we do NOT
+            # blindly copy root's authorized_keys (which may hold stale/unknown keys).
+            if [ -n "${AUTHORIZED_KEY:-}" ]
+            then
+                echo " $(date +%m.%d.%Y_%H:%M:%S) : Admin key supplied; skipping copy of root's authorized_keys" | tee -a "$LOGFILE"
+            elif [ -e /root/.ssh/authorized_keys ]
             then mkdir /home/"${UNAME,,}"/.ssh
                 chmod 700 /home/"${UNAME,,}"/.ssh
                 # copy root SSH key to new non-root user
@@ -424,6 +804,97 @@ function add_user() {
     echo -e -n "${nocolor}"
 }
 
+##########################
+## INSTALL ADMIN SSH KEY ##
+##########################
+
+function install_admin_key() {
+    # Phase 2: install a supplied admin PUBLIC key (public key only).
+    # Source of the key: AUTHORIZED_KEY env var (set by automation / future
+    # --admin-key flag) or an interactive prompt. When a key is supplied we
+    # install it (append + dedupe) and rely on add_user() having skipped the
+    # blind copy of root's authorized_keys. If none is supplied we do nothing -
+    # add_user()'s copy-from-root fallback already ran.
+    local key="${AUTHORIZED_KEY:-}"
+
+    # No key from env -> offer an interactive prompt (skipped in non-interactive mode).
+    if [ -z "$key" ] && [ "${ASSUME_YES:-no}" != "yes" ]; then
+        echo -e -n "${lightcyan}"
+        figlet Admin Key | tee -a "$LOGFILE"
+        echo -e -n "${cyan}"
+        echo -e " You can install an admin SSH PUBLIC key now (recommended)."
+        echo -e " Paste one public key line (e.g. 'ssh-ed25519 AAAA... you@host'),"
+        echo -e " or just press ENTER to skip and keep existing key handling.\n"
+        read -r -p " Admin public key (or ENTER to skip): " key
+        echo -e "${nocolor}"
+    fi
+
+    # Nothing supplied -> skip cleanly.
+    if [ -z "$key" ]; then
+        echo -e -n "${yellow}"
+        echo -e " --> No admin public key supplied; skipping (existing key handling kept)." | tee -a "$LOGFILE"
+        echo -e -n "${nocolor}"
+        return 0
+    fi
+
+    # Refuse anything that looks like a PRIVATE key - never put one on the server.
+    if echo "$key" | grep -qiE 'PRIVATE KEY'; then
+        echo -e -n "${lightred}"
+        echo -e " --> That looks like a PRIVATE key. Never place a private key on the server. Skipping." | tee -a "$LOGFILE"
+        echo -e -n "${nocolor}"
+        return 0
+    fi
+
+    # Validate it is a real public key. Prefer ssh-keygen; if that tool is
+    # unavailable, fall back to a prefix check so a valid key is not rejected.
+    local valid="no"
+    if command -v ssh-keygen >/dev/null 2>&1; then
+        local tmpkey; tmpkey="$(mktemp)"
+        printf '%s\n' "$key" > "$tmpkey"
+        if ssh-keygen -l -f "$tmpkey" >/dev/null 2>&1; then valid="yes"; fi
+        rm -f "$tmpkey"
+    elif echo "$key" | grep -qE '^(ssh-(rsa|ed25519|dss)|ecdsa-sha2-[a-z0-9-]+|sk-(ssh-ed25519|ecdsa-sha2-)[a-z0-9@.-]*) [A-Za-z0-9+/]+=*( .*)?$'; then
+        valid="yes"
+    fi
+    if [ "$valid" != "yes" ]; then
+        echo -e -n "${lightred}"
+        echo -e " --> Not a valid SSH public key; skipping admin key install." | tee -a "$LOGFILE"
+        echo -e -n "${nocolor}"
+        return 0
+    fi
+
+    # Target the new non-root user if one was created, else root.
+    local target home akfile
+    if [ -n "${UNAME:-}" ] && id -u "${UNAME,,}" >/dev/null 2>&1; then
+        target="${UNAME,,}"
+    else
+        target="root"
+    fi
+    home="$(getent passwd "$target" | cut -d: -f6)"
+    [ -z "$home" ] && home="/root"
+    akfile="$home/.ssh/authorized_keys"
+
+    step_begin "install_admin_key"
+    install -d -m 700 -o "$target" -g "$target" "$home/.ssh"
+    change_record "$akfile"
+    touch "$akfile"
+    # Append only if not already present (dedupe).
+    if grep -qxF "$key" "$akfile" 2>/dev/null; then
+        echo -e " --> Admin key already present for $target; no change made." | tee -a "$LOGFILE"
+    else
+        printf '%s\n' "$key" >> "$akfile"
+    fi
+    chown "$target":"$target" "$akfile"
+    chmod 600 "$akfile"
+    step_commit
+
+    echo -e -n "${lightgreen}"
+    echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
+    echo -e " $(date +%m.%d.%Y_%H:%M:%S) : SUCCESS : admin public key installed for $target" | tee -a "$LOGFILE"
+    echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
+    echo -e -n "${nocolor}"
+}
+
 ################
 ## SSH CONFIG ##
 ################
@@ -445,21 +916,29 @@ function collect_sshd() {
     echo -e " By default, SSH traffic occurs on port 22, so hackers are always"
     echo -e " scanning port 22 for vulnerabilities. If you change your server to"
     echo -e " use a different port, you gain some security through obscurity.\n"
-    while :; do
-        echo -e -n "${cyan}"
-        read -p " Enter a custom port for SSH between 11000 and 65535 or use 22: " SSHPORT
-        [[ $SSHPORT =~ ^[0-9]+$ ]] || { echo -e -n "${lightred}";echo -e " --> Try harder, that's not even a number. \n";echo -e -n "${nocolor}";continue; }
-        if (($SSHPORT >= 11000 && $SSHPORT <= 65535)); then break
-        elif [ "$SSHPORT" = 22 ]; then break
-        else echo -e -n "${lightred}"
-            echo -e " --> That number is out of range, try again. \n"
-            echo "---------------------------------------------------- " >> $LOGFILE 2>&1
-            echo " $(date +%m.%d.%Y_%H:%M:%S) : ERROR: User entered: $SSHPORT " >> $LOGFILE 2>&1
-            echo "---------------------------------------------------- " >> $LOGFILE 2>&1
-            echo -e -n "${nocolor}"
-        fi
-    done
-    # Take a backup of the existing config
+    if [ -n "${SSH_PORT_OPT:-}" ]; then
+        SSHPORT="$SSH_PORT_OPT"
+    elif [ "${ASSUME_YES:-no}" = "yes" ]; then
+        SSHPORT="22"
+    else
+        while :; do
+            echo -e -n "${cyan}"
+            read -p " Enter a custom port for SSH between 11000 and 65535 or use 22: " SSHPORT
+            [[ $SSHPORT =~ ^[0-9]+$ ]] || { echo -e -n "${lightred}";echo -e " --> Try harder, that's not even a number. \n";echo -e -n "${nocolor}";continue; }
+            if (($SSHPORT >= 11000 && $SSHPORT <= 65535)); then break
+            elif [ "$SSHPORT" = 22 ]; then break
+            else echo -e -n "${lightred}"
+                echo -e " --> That number is out of range, try again. \n"
+                echo "---------------------------------------------------- " >> $LOGFILE 2>&1
+                echo " $(date +%m.%d.%Y_%H:%M:%S) : ERROR: User entered: $SSHPORT " >> $LOGFILE 2>&1
+                echo "---------------------------------------------------- " >> $LOGFILE 2>&1
+                echo -e -n "${nocolor}"
+            fi
+        done
+    fi
+    # Take a backup of the existing config (also record it in the backout manifest)
+    step_begin "ssh_config"
+    change_record "$SSHDFILE"
     BTIME=$(date +%F_%R)
     cat $SSHDFILE > $SSHDFILE."$BTIME".bak
     echo -e "\n"
@@ -495,6 +974,7 @@ function collect_sshd() {
 
     # Set SSHPORTIS to the final value of the SSH port
     SSHPORTIS=$(sed -n -e '/^Port /p' $SSHDFILE)
+    step_commit
 }
 
 function prompt_rootlogin {
@@ -523,14 +1003,10 @@ function prompt_rootlogin {
         echo -e "---------------------------------------------------- \n" | tee -a "$LOGFILE"
         
             echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to disable root login? y/n  " ROOTLOGIN
-            if [[ ${ROOTLOGIN,,} == "y" || ${ROOTLOGIN,,} == "Y" || ${ROOTLOGIN,,} == "N" || ${ROOTLOGIN,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            # non-interactive default: only disable root login if a non-root user
+            # or an admin key exists, to avoid locking out the only access.
+            if [ -n "${USER_OPT:-}" ] || [ -n "${AUTHORIZED_KEY:-}" ]; then _rl_def="y"; else _rl_def="n"; fi
+            ask_yn ROOTLOGIN "Would you like to disable root login? y/n" "$_rl_def"
         echo -e "${nocolor}"
         
         # check if ROOTLOGIN is valid
@@ -616,14 +1092,10 @@ function disable_passauth() {
         echo -e "--------------------------------------------------- " >> $LOGFILE 2>&1
         
         echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to disable password login & require RSA key login? y/n  " PASSLOGIN
-            if [[ ${PASSLOGIN,,} == "y" || ${PASSLOGIN,,} == "Y" || ${PASSLOGIN,,} == "N" || ${PASSLOGIN,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            # non-interactive default: only require key-only login when an admin
+            # key was supplied - otherwise this would lock out password users.
+            if [ -n "${AUTHORIZED_KEY:-}" ]; then _pa_def="y"; else _pa_def="n"; fi
+            ask_yn PASSLOGIN "Would you like to disable password login & require RSA key login? y/n" "$_pa_def"
         echo -e "${nocolor}\n"
         
         # check if PASSLOGIN is valid
@@ -682,6 +1154,12 @@ function disable_passauth() {
 ################
 
 function ufw_config() {
+    if ! is_debian_family; then
+        echo -e "${yellow} --> Non-Debian distro: applying portable firewall baseline instead of UFW.${nocolor}" | tee -a "$LOGFILE"
+        firewall_nondebian "${SSHPORT:-22}"
+        FIREWALLP="n"
+        return 0
+    fi
     # query user to disable password authentication or not
     echo -e -n "${lightcyan}"
     figlet Firewall Config | tee -a "$LOGFILE"
@@ -698,17 +1176,13 @@ function ufw_config() {
     echo -e " * If you already configured UFW, choose NO to keep your existing rules\n"
     
         echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to enable UFW firewall and assign basic rules? y/n  " FIREWALLP
-            if [[ ${FIREWALLP,,} == "y" || ${FIREWALLP,,} == "Y" || ${FIREWALLP,,} == "N" || ${FIREWALLP,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            ask_yn FIREWALLP "Would you like to enable UFW firewall and assign basic rules? y/n" "y"
         echo -e "${nocolor}\n"
     
-    if [ "${FIREWALLP,,}" = "Y" ] || [ "${FIREWALLP,,}" = "y" ]
+    if { [ "${FIREWALLP,,}" = "Y" ] || [ "${FIREWALLP,,}" = "y" ]; } && skip_in_container "firewall (UFW) configuration"; then
+        # netfilter is host-managed in containers; ensure restart_sshd won't try to enable UFW
+        FIREWALLP="n"
+    elif [ "${FIREWALLP,,}" = "Y" ] || [ "${FIREWALLP,,}" = "y" ]
     then	echo -e -n "${nocolor}"
         # make sure ufw is installed #
         apt-get install ufw -qqy >> $LOGFILE 2>&1
@@ -761,19 +1235,13 @@ function server_hardening() {
     echo -e " installation of security updates.\n"
 
         echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to perform these steps now? y/n  " GETHARD
-            if [[ ${GETHARD,,} == "y" || ${GETHARD,,} == "Y" || ${GETHARD,,} == "N" || ${GETHARD,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            ask_yn GETHARD "Would you like to perform these steps now? y/n" "y"
         echo -e "${nocolor}\n"    
     
     # check if GETHARD is valid
     if [ "${GETHARD,,}" = "Y" ] || [ "${GETHARD,,}" = "y" ]
     then
+        step_begin "server_hardening"
 
         # secure shared memory
         echo -e -n "${yellow}"
@@ -785,9 +1253,13 @@ function server_hardening() {
         echo -e ' tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0' | tee -a "$LOGFILE"
         echo -e "---------------------------------------------------- \n" | tee -a "$LOGFILE"
         sleep 2	; #  dramatic pause
+        # /run/shm and fstab mounts are host-managed inside containers - skip there
+        if skip_in_container "shared memory hardening"; then :
         # only add line if line does not already exist in /etc/fstab
-        if grep -q "tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0" /etc/fstab; then :
-        else echo 'tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0' >> /etc/fstab
+        elif grep -q "tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0" /etc/fstab; then :
+        else
+            change_record /etc/fstab
+            echo 'tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0' >> /etc/fstab
         fi
 
         # enable DDOS protection
@@ -799,7 +1271,14 @@ function server_hardening() {
         echo -e " Replace /etc/ufw/before.rules with hardened rules " | tee -a "$LOGFILE"
         echo -e "---------------------------------------------------- \n " | tee -a "$LOGFILE"
         sleep 2	; #  dramatic pause
-        cat etc/ufw/before.rules > /etc/ufw/before.rules
+        # UFW before.rules is Debian/UFW-specific and host-managed in containers.
+        if ! is_debian_family; then
+            echo -e " --> Skipping UFW before.rules on non-Debian distro." | tee -a "$LOGFILE"
+        elif skip_in_container "UFW DDOS before.rules"; then :
+        else
+            change_record /etc/ufw/before.rules
+            cat etc/ufw/before.rules > /etc/ufw/before.rules
+        fi
 
         # harden the networking layer
         echo -e -n "${yellow}"
@@ -810,7 +1289,12 @@ function server_hardening() {
         echo -e " --> Secure /etc/sysctl.conf with hardening rules " | tee -a "$LOGFILE"
         echo -e "---------------------------------------------------- \n " | tee -a "$LOGFILE"
         sleep 2	; #  dramatic pause
-        cat etc/sysctl.conf > /etc/sysctl.conf
+        # kernel sysctl is largely read-only/namespaced inside containers - skip there
+        if skip_in_container "sysctl network hardening"; then :
+        else
+            change_record /etc/sysctl.conf
+            cat etc/sysctl.conf > /etc/sysctl.conf
+        fi
 
         # enable automatic security updates
         echo -e -n "${yellow}"
@@ -822,14 +1306,24 @@ function server_hardening() {
         echo -e "---------------------------------------------------- \n " | tee -a "$LOGFILE"
         sleep 2	; #  dramatic pause
 
-        . /etc/os-release
-        if [[ "${VERSION_ID}" = "16.04" ]] 
-        then cat etc/apt/apt.conf.d/10periodic > /etc/apt/apt.conf.d/10periodic
-        else cat etc/apt/apt.conf.d/20auto-upgrades > /etc/apt/apt.conf.d/20auto-upgrades
+        # apt unattended-upgrades is Debian-specific.
+        if ! is_debian_family; then
+            echo -e " --> Skipping apt unattended-upgrades on non-Debian distro." | tee -a "$LOGFILE"
+        else
+            . /etc/os-release
+            if [[ "${VERSION_ID}" = "16.04" ]]
+            then
+                change_record /etc/apt/apt.conf.d/10periodic
+                cat etc/apt/apt.conf.d/10periodic > /etc/apt/apt.conf.d/10periodic
+            else
+                change_record /etc/apt/apt.conf.d/20auto-upgrades
+                cat etc/apt/apt.conf.d/20auto-upgrades > /etc/apt/apt.conf.d/20auto-upgrades
+            fi
+            change_record /etc/apt/apt.conf.d/50unattended-upgrades
+            cat etc/apt/apt.conf.d/50unattended-upgrades > /etc/apt/apt.conf.d/50unattended-upgrades
+            # consider editing the above 50-unattended-upgrades to auto-reboot when necessary
         fi
-
-        cat etc/apt/apt.conf.d/50unattended-upgrades > /etc/apt/apt.conf.d/50unattended-upgrades
-        # consider editing the above 50-unattended-upgrades to automatically reboot when necessary
+        step_commit
 
         # Error Handling
         if [ $? -eq 0 ]
@@ -876,14 +1370,7 @@ function google_auth() {
     echo -e " requires you to use the Google Authenticator app on your phone.\n"
 
         echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to install Google 2FA Authentication? y/n  " GOOGLEAUTH
-            if [[ ${GOOGLEAUTH,,} == "y" || ${GOOGLEAUTH,,} == "Y" || ${GOOGLEAUTH,,} == "N" || ${GOOGLEAUTH,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            ask_yn GOOGLEAUTH "Would you like to install Google 2FA Authentication? y/n" "n"
         echo -e "${nocolor}\n"    
     
     # check if GOOGLEAUTH is valid
@@ -954,6 +1441,9 @@ function google_auth() {
 
 function ksplice_install() {
 
+    # Ksplice live-patches the kernel; containers share the host kernel - skip there
+    if skip_in_container "Ksplice kernel live-patching"; then return; fi
+
     # This KSplice install script only works for Ubuntu 16.04 at the moment
     if [[ -r /etc/os-release ]]; then
         . /etc/os-release
@@ -980,14 +1470,7 @@ function ksplice_install() {
     echo -e " To minimize server downtime, this is a good thing to install.\n"
     
         echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to install Oracle Ksplice Uptrack now? y/n  " KSPLICE
-            if [[ ${KSPLICE,,} == "y" || ${KSPLICE,,} == "Y" || ${KSPLICE,,} == "N" || ${KSPLICE,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            ask_yn KSPLICE "Would you like to install Oracle Ksplice Uptrack now? y/n" "n"
         echo -e "${nocolor}\n" 
 
         if [ "${KSPLICE,,}" = "Y" ] || [ "${KSPLICE,,}" = "y" ]
@@ -1092,14 +1575,7 @@ function motd_install() {
     echo -e " access.  All modifications are strictly cosmetic.\n"
 
         echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to enhance your MOTD & login banner? y/n  " MOTDP
-            if [[ ${MOTDP,,} == "y" || ${MOTDP,,} == "Y" || ${MOTDP,,} == "N" || ${MOTDP,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            ask_yn MOTDP "Would you like to enhance your MOTD & login banner? y/n" "y"
         echo -e "${nocolor}\n" 
 
     # check if MOTDP is affirmative
@@ -1161,21 +1637,14 @@ function restart_sshd() {
     echo -e " from getting locked out of your server.\n"
 
         echo -e -n "${cyan}"
-            while :; do
-            echo -e "\n"
-            read -n 1 -s -r -p " Would you like to restart SSHD and enable UFW now? y/n  " SSHDRESTART
-            if [[ ${SSHDRESTART,,} == "y" || ${SSHDRESTART,,} == "Y" || ${SSHDRESTART,,} == "N" || ${SSHDRESTART,,} == "n" ]]
-            then
-                break
-            fi
-        done
+            ask_yn SSHDRESTART "Would you like to restart SSHD and enable UFW now? y/n" "y"
         echo -e "${nocolor}\n" 
 
     # check if SSHDRESTART is valid
     if [ "${SSHDRESTART,,}" = "Y" ] || [ "${SSHDRESTART,,}" = "y" ]
     then
         # insert a pause or delay to add suspense
-        systemctl restart sshd
+        svc_restart sshd ssh
         if [ "$FIREWALLP" = "yes" ] || [ "$FIREWALLP" = "y" ]
         then ufw --force enable | tee -a "$LOGFILE"
             echo -e " \n" | tee -a "$LOGFILE"
@@ -1207,6 +1676,217 @@ function restart_sshd() {
         echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
         echo -e " *** User elected not to restart SSH at this time *** " | tee -a "$LOGFILE"
         echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
+        echo -e -n "${nocolor}"
+    fi
+}
+
+##############################
+## Bitwarden Host-Key Backup ##
+##############################
+
+function bitwarden_backup() {
+    # Phase 3: OPTIONAL backup of this server's SSH HOST keys to Bitwarden.
+    # Entirely opt-in and NON-FATAL: if declined, or bw/jq are missing, or any
+    # call fails, hardening still succeeds. Runs after restart_sshd so it can
+    # never interfere with restoring SSH access. Bitwarden is never required.
+    echo -e -n "${lightcyan}"
+    figlet Bitwarden | tee -a "$LOGFILE"
+    echo -e -n "${lightcyan}"
+    echo -e " OPTIONAL: back up this server's SSH HOST keys (/etc/ssh/ssh_host_*)"
+    echo -e " to Bitwarden so a rebuilt server can keep its host identity."
+    echo -e -n "${yellow}"
+    echo -e " NOTE: host keys are sensitive - anyone who obtains them can impersonate"
+    echo -e " this server. Only do this if your Bitwarden vault is trusted.\n"
+    echo -e -n "${cyan}"
+
+    local DOBW=""
+    # non-interactive default: skip unless a vault session or Secrets Manager
+    # token is pre-supplied (BW_SESSION / BWS_ACCESS_TOKEN).
+    local _bw_def="n"; { [ -n "${BW_SESSION:-}" ] || [ -n "${BWS_ACCESS_TOKEN:-}" ]; } && _bw_def="y"
+    ask_yn DOBW "Back up SSH host keys to Bitwarden now? y/n" "$_bw_def"
+    echo -e "${nocolor}\n"
+    if [ "${DOBW,,}" != "y" ]; then
+        echo -e -n "${yellow}"
+        echo -e " --> User declined Bitwarden host-key backup; skipping." | tee -a "$LOGFILE"
+        echo -e -n "${nocolor}"
+        return 0
+    fi
+
+    # --- Bitwarden Secrets Manager profile (unattended automation) ---
+    # If a machine-account token is present and the bws CLI is available, store
+    # each host key as a base64 secret instead of using an interactive vault.
+    if [ -n "${BWS_ACCESS_TOKEN:-}" ] && command -v bws >/dev/null 2>&1; then
+        if [ -z "${BWS_PROJECT_ID:-}" ]; then
+            echo -e " --> BWS_ACCESS_TOKEN set but BWS_PROJECT_ID missing; falling back to bw vault." | tee -a "$LOGFILE"
+        else
+            set +x
+            local sf sbase scount=0
+            for sf in /etc/ssh/ssh_host_*; do
+                [ -e "$sf" ] || continue
+                sbase="vps-harden/$(hostname)/$(basename "$sf")"
+                if bws secret create "$sbase" "$(base64 -w0 "$sf")" "$BWS_PROJECT_ID" >/dev/null 2>>"$LOGFILE"; then
+                    scount=$((scount+1))
+                else
+                    echo -e " --> bws secret create failed for $sf" | tee -a "$LOGFILE"
+                fi
+            done
+            echo -e -n "${lightgreen}"
+            echo -e " --> Stored $scount host-key secret(s) via Bitwarden Secrets Manager." | tee -a "$LOGFILE"
+            echo -e -n "${nocolor}"
+            return 0
+        fi
+    fi
+
+    # Soft dependencies - detect, never auto-install.
+    if ! command -v bw >/dev/null 2>&1; then
+        echo -e " --> Bitwarden CLI (bw) not found; skipping host-key backup." | tee -a "$LOGFILE"
+        return 0
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo -e " --> jq not found; skipping host-key backup." | tee -a "$LOGFILE"
+        return 0
+    fi
+
+    # Resolve a session without writing secrets to the log. Prefer BW_SESSION;
+    # otherwise unlock interactively (master password prompt goes to the tty).
+    set +x
+    local sess="${BW_SESSION:-}"
+    if [ -z "$sess" ]; then
+        echo -e " Unlocking Bitwarden vault..."
+        sess="$(bw unlock --raw 2>>"$LOGFILE")" || true
+    fi
+    if [ -z "$sess" ]; then
+        echo -e " --> No Bitwarden session available; skipping host-key backup." | tee -a "$LOGFILE"
+        return 0
+    fi
+
+    if ! bw sync --session "$sess" >/dev/null 2>>"$LOGFILE"; then
+        echo -e " --> bw sync failed; skipping host-key backup." | tee -a "$LOGFILE"
+        unset sess
+        return 0
+    fi
+
+    local host mid itemname folderid notes
+    host="$(hostname)"
+    mid="$(cat /etc/machine-id 2>/dev/null || echo unknown)"
+    itemname="vps-harden/$host"
+
+    # Find or create the 'vps-harden' folder.
+    folderid="$(bw list folders --session "$sess" 2>>"$LOGFILE" | jq -r '.[] | select(.name=="vps-harden") | .id' | head -n1)"
+    if [ -z "$folderid" ] || [ "$folderid" = "null" ]; then
+        folderid="$(bw get template folder | jq '.name="vps-harden"' | bw encode | bw create folder --session "$sess" 2>>"$LOGFILE" | jq -r '.id')"
+    fi
+
+    # Update-if-exists: delete any existing items with this exact name so a re-run
+    # never litters the vault with duplicates or stale attachments.
+    local id
+    for id in $(bw list items --search "$itemname" --session "$sess" 2>>"$LOGFILE" | jq -r --arg n "$itemname" '.[] | select(.name==$n) | .id'); do
+        bw delete item "$id" --session "$sess" >/dev/null 2>>"$LOGFILE" || true
+    done
+
+    # Create a secure-note item and attach every present host-key file.
+    notes="SSH host key backup for ${host} (machine-id ${mid}). Created by vps-lockdown on $(date)."
+    local itemid
+    itemid="$(bw get template item \
+        | jq --arg n "$itemname" --arg notes "$notes" --arg f "$folderid" \
+            '.type=2 | .secureNote.type=0 | .name=$n | .notes=$notes | (if $f=="" or $f=="null" then . else .folderId=$f end)' \
+        | bw encode | bw create item --session "$sess" 2>>"$LOGFILE" | jq -r '.id')"
+    if [ -z "$itemid" ] || [ "$itemid" = "null" ]; then
+        echo -e " --> Could not create Bitwarden item; skipping host-key backup." | tee -a "$LOGFILE"
+        unset sess
+        return 0
+    fi
+
+    local f count=0
+    for f in /etc/ssh/ssh_host_*; do
+        [ -e "$f" ] || continue
+        if bw create attachment --file "$f" --itemid "$itemid" --session "$sess" >/dev/null 2>>"$LOGFILE"; then
+            count=$((count+1))
+        else
+            echo -e " --> Failed to attach $f" | tee -a "$LOGFILE"
+        fi
+    done
+    bw sync --session "$sess" >/dev/null 2>>"$LOGFILE" || true
+    unset sess BW_SESSION
+
+    echo -e -n "${lightgreen}"
+    echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
+    echo -e " $(date +%m.%d.%Y_%H:%M:%S) : SUCCESS : backed up $count host-key file(s) to Bitwarden item '$itemname'" | tee -a "$LOGFILE"
+    echo -e "---------------------------------------------------- " | tee -a "$LOGFILE"
+    echo -e -n "${nocolor}"
+}
+
+##############################
+## Audit Gate (vps-audit)   ##
+##############################
+
+# Locate the read-only vps-audit.sh companion, if present.
+function find_vps_audit() {
+    local c
+    for c in \
+        "$(dirname "$0")/vps-audit.sh" \
+        "$(dirname "$0")/../vps-audit/vps-audit.sh" \
+        "./vps-audit.sh" \
+        "../vps-audit/vps-audit.sh" \
+        "/opt/vps-audit/vps-audit.sh"; do
+        [ -f "$c" ] && { echo "$c"; return 0; }
+    done
+    command -v vps-audit.sh >/dev/null 2>&1 && { command -v vps-audit.sh; return 0; }
+    return 1
+}
+
+# 'Harden, then audit' gate: run vps-audit.sh --json and block roll-forward if any
+# CRITICAL check FAILs, unless --ignore-audit-failures was given. Read-only and
+# non-fatal when the audit tool is absent (it's a gate, not a hard dependency).
+function run_audit_gate() {
+    local label="${1:-post-hardening}"
+    local audit json crit
+    audit="$(find_vps_audit)" || true
+
+    echo -e -n "${lightcyan}"
+    figlet Audit Gate | tee -a "$LOGFILE"
+    echo -e -n "${nocolor}"
+
+    if [ -z "$audit" ]; then
+        echo -e -n "${yellow}"
+        echo -e " --> vps-audit.sh not found; skipping audit gate ($label)." | tee -a "$LOGFILE"
+        echo -e " (Place vps-audit.sh alongside this script or in ../vps-audit/ to enable it.)" | tee -a "$LOGFILE"
+        echo -e -n "${nocolor}"
+        return 0
+    fi
+
+    echo -e " Running read-only audit: $audit --json" | tee -a "$LOGFILE"
+    json="$(bash "$audit" --json 2>>"$LOGFILE")" || true
+
+    # Parse critical_fails with jq, fall back to grep if jq is unavailable.
+    if command -v jq >/dev/null 2>&1; then
+        crit="$(printf '%s' "$json" | jq -r '.critical_fails' 2>/dev/null)"
+    fi
+    if [ -z "$crit" ] || [ "$crit" = "null" ]; then
+        crit="$(printf '%s' "$json" | grep -o '"critical_fails":[0-9]*' | grep -o '[0-9]*' | head -n1)"
+    fi
+    [ -z "$crit" ] && crit=0
+
+    if [ "$crit" -gt 0 ] 2>/dev/null; then
+        echo -e -n "${lightred}"
+        echo -e " --> Audit gate ($label): $crit critical check(s) FAILED:" | tee -a "$LOGFILE"
+        if command -v jq >/dev/null 2>&1; then
+            printf '%s' "$json" | jq -r '.results[]? | select(.critical and .status=="FAIL") | "     - " + .name + ": " + .message' 2>/dev/null | tee -a "$LOGFILE"
+        fi
+        echo -e -n "${nocolor}"
+        if [ "${IGNORE_AUDIT_FAILURES:-no}" = "yes" ]; then
+            echo -e -n "${yellow}"
+            echo -e " --> Continuing anyway (--ignore-audit-failures set)." | tee -a "$LOGFILE"
+            echo -e -n "${nocolor}"
+        else
+            echo -e -n "${lightred}"
+            echo -e " --> Halting. Re-run with --ignore-audit-failures to override." | tee -a "$LOGFILE"
+            echo -e -n "${nocolor}"
+            exit 2
+        fi
+    else
+        echo -e -n "${lightgreen}"
+        echo -e " --> Audit gate ($label): no critical failures." | tee -a "$LOGFILE"
         echo -e -n "${nocolor}"
     fi
 }
@@ -1280,24 +1960,41 @@ EOF
     echo -e -n "${nocolor}"
 }
 
+# ---- parse CLI flags (non-interactive automation) ----
+parse_args "$@"
+
+# --audit: read-only mode - just run the audit companion and exit, no changes.
+if [ "$AUDIT_ONLY" = "yes" ]; then
+    _audit="$(find_vps_audit)" || true
+    if [ -n "$_audit" ]; then bash "$_audit"; exit $?; fi
+    echo "vps-audit.sh not found; cannot run --audit." >&2
+    exit 1
+fi
+
 check_distro
 setup_environment
 display_banner
 begin_log
+init_backout
+detect_container
 create_swap
 update_upgrade
 favored_packages
 crypto_packages
 add_user
+install_admin_key
 collect_sshd
 prompt_rootlogin
 disable_passauth
 ufw_config
 server_hardening
+cis_baseline
 google_auth
 ksplice_install
 motd_install
 restart_sshd
+bitwarden_backup
 install_complete
+run_audit_gate "post-hardening"
 
 exit
