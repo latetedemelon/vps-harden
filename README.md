@@ -76,9 +76,16 @@ Bitwarden, and hand only the public key to the server:
 | Debian / Ubuntu | **Fully supported** (original target) |
 | RHEL / Fedora / Alpine / SUSE / Arch | Experimental — universal steps run; apt/ufw-only steps are replaced by portable equivalents (firewalld/nftables, `useradd`/`wheel`) |
 
-> ⚠️ **Validation:** the automation, Bitwarden, and non-Debian paths currently
-> pass syntax + isolated logic tests only. Validate on a throwaway VM before
-> using in production.
+> ## ⚠️ EXPERIMENTAL — not yet validated end-to-end
+>
+> `vps-lockdown.sh` has **never been run start-to-finish on a real server.** Only
+> specific mechanisms are tested in isolation (backout/revert, the sshd
+> validate-and-restore lockout guard, the admin-key install, the audit gate against
+> real `vps-audit --json`). **Entirely unproven:** the Bitwarden integration, every
+> non-Debian path (RHEL/Alpine/SUSE/Arch), and `--cis`.
+>
+> **Do not run this on a server you care about.** Test on a throwaway VM first — an
+> end-to-end harness is provided at [`test/oci-e2e-test.sh`](test/oci-e2e-test.sh).
 
 If this script helps you out, please contribute some feedback. Donations are also welcome and help permit me to continue to develop this and other projects.
 

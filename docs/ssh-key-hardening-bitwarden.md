@@ -1,20 +1,33 @@
 # VPS Hardening Suite — Design & Implementation Plan
 
-Status: **Phases 1–7 implemented (pending real-host validation)** — container
-guard, per-step backout, `install_admin_key()`, optional `bitwarden_backup()`
-(vault + Secrets Manager), the `vps-audit` audit gate, a non-interactive CLI flag
-parser, the `bootstrap-admin-key.sh` helper, a distro/package/service abstraction
-with portable user creation + firewall (firewalld/nftables/iptables), an optional
-`--cis` baseline (auditd/AIDE/login.defs/sysctl), and docs are all in place (with
-the `vps-audit --json` companion in
+Status: **EXPERIMENTAL — feature-complete on paper, never run end-to-end.** The
+container guard, per-step backout, `install_admin_key()`, optional
+`bitwarden_backup()` (vault + Secrets Manager), the `vps-audit` audit gate, a
+non-interactive CLI flag parser, the `bootstrap-admin-key.sh` helper, a
+distro/package/service abstraction with portable user creation + firewall
+(firewalld/nftables/iptables), and an optional `--cis` baseline are all written
+(companion `vps-audit --json` in
 [vps-audit#3](https://github.com/latetedemelon/vps-audit/pull/3)).
 
-> ⚠️ **Validation status:** everything past Phase 1 is verified only by `bash -n`
-> and isolated unit-style tests. **No end-to-end run on any real VM has happened**
-> — the non-Debian (RHEL/Alpine/SUSE/Arch) paths in particular are written but
-> entirely unexercised. Oracle free-tier testing is **blocked**: no OCI
-> credentials or `oci`/`terraform` CLI are present in the build environment, so
-> instances cannot be provisioned from here (see "Testing" below).
+> ⚠️ **Validation status — read before trusting the script.**
+> `vps-lockdown.sh` has **never been run start-to-finish on any VM.** What *is*
+> verified (`bash -n` plus isolated unit tests, all passing): container detection;
+> `install_admin_key` (install / dedupe / private-key + garbage rejection);
+> **per-step revert** (a failed mutation restores its backups via
+> `fail_step`/`step_revert`); the **sshd-config validate-and-restore lockout guard**
+> (a bad config is detected, restored from the pre-change backup, and re-validated
+> before any restart); distro classification; and the **audit gate against the real
+> `vps-audit --json` output** (parses `critical_fails`, exits 2).
+>
+> **NOT verified at all:** any full run of the script; the entire **Bitwarden**
+> path (no `bw`/`jq` was ever available — vault item schema, Secrets Manager, and
+> attachments are unexercised); every **non-Debian** path (RHEL/Alpine/SUSE/Arch
+> user creation, firewalld/nftables, package installs); and the **`--cis`**
+> baseline. Treat all of these as unproven until a real run confirms them.
+>
+> A runnable end-to-end harness is at `test/oci-e2e-test.sh`; it needs an
+> environment with SSH (port 22) egress and a configured `oci` CLI. The build
+> sandbox used here blocks outbound 22, so it could not be executed by the author.
 
 ### Distro support matrix
 
@@ -350,16 +363,29 @@ self-contained and reverts itself on failure; the script never tries to "undo th
 entire run" as a single operation. Adopt the pratiktri pattern (timestamped
 backups + revert functions) at step granularity:
 
-- A `change_record <path>` helper copies any file to
-  `<path>.vps-harden.<timestamp>.bak` **before** that step modifies it, and for
-  non-file changes (package installs, `ufw enable`, service state) records the
-  matching inverse action (e.g. `ufw disable`, `apt remove`).
-- **Each step runs under its own `trap`**: if the step fails, **only that step
-  auto-reverts** — restoring its `.bak` / running its inverse, then `sshd -t` and
-  reload where SSH is involved — and the run stops cleanly with SSH intact. No
-  half-applied change is left behind. This is the contract.
-- A manifest at `/var/backups/vps-harden/<run-id>/manifest` is still written, but
-  **for auditability and manual recovery**, not as an automatic full-run replay.
+What is **actually implemented** (verified by isolated unit tests):
+
+- `change_record <path>` copies a file into the run's backup dir **before** a step
+  modifies it (and records `ABSENT` for a file that did not yet exist, so revert
+  deletes it); `record_inverse` stores an undo command for non-file changes.
+- **Revert on a failed mutation:** guarded steps (`create_swap`,
+  `install_admin_key`, `server_hardening`) run their mutating commands as
+  `<mutation> || fail_step`. `fail_step` calls `step_revert`, which restores that
+  step's `.bak` files and runs its inverse commands, then returns non-zero so the
+  step stops. Tested: a failed write restores the original file and logs
+  `REVERTED`. (This is explicit per-step handling, **not** a blanket `set -e`/ERR
+  trap wrapping every command — that was the earlier claim and was never true.)
+- **SSH lockout guard (the important one):** `collect_sshd` saves a known-good
+  `SSHD_PRE_BACKUP`; before any restart, `restart_sshd` runs `sshd -t`, and if the
+  edited config is invalid it **restores the pre-change backup, re-validates, and
+  refuses to restart** if it is still bad — so a broken edit cannot lock you out.
+  Tested with a stub `sshd`.
+- A top-level `trap on_interrupt INT TERM` points the operator at the manifest if
+  the run is interrupted (Ctrl-C / kill).
+- A manifest at `/var/backups/vps-harden/<run-id>/manifest` records every backup
+  and action **for auditability and manual recovery**, not as an automatic
+  full-run replay. Steps that are not in the guarded set above record their
+  backups to the manifest but do not auto-revert — manual restore only.
 - This is the safety net that makes the aggressive SSH/firewall/CIS changes in
   §7.4 safe to apply.
 - Extends — not replaces — the existing `sshd_config` backup (`vps-lockdown.sh:464`).

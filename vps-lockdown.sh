@@ -187,6 +187,7 @@ function init_backout() {
     chmod 700 "$BACKUP_ROOT" "$RUN_DIR" 2>/dev/null
     : > "$MANIFEST"
     echo "# vps-lockdown backout manifest - run $RUN_ID - $(date)" >> "$MANIFEST"
+    trap on_interrupt INT TERM
     echo -e -n "${white}"
     echo -e " $(date +%m.%d.%Y_%H:%M:%S) : Backout manifest at $MANIFEST" | tee -a "$LOGFILE"
     echo -e -n "${nocolor}"
@@ -249,6 +250,24 @@ function step_revert() {
 # Mark the current step as successfully committed.
 function step_commit() {
     echo "COMMIT $CURRENT_STEP $(date +%s)" >> "$MANIFEST"
+}
+
+# Fail the current step: revert its recorded changes and return non-zero. Callers
+# use it as `<mutation> || fail_step` so a failed mutation restores that step.
+function fail_step() {
+    step_revert
+    return 1
+}
+
+# Installed at startup (init_backout). On Ctrl-C / kill mid-run, point the operator
+# at the backout manifest so partially-applied changes can be restored by hand.
+function on_interrupt() {
+    echo -e -n "${lightred}"
+    echo -e "\n --> Interrupted - partial changes may be applied." | tee -a "$LOGFILE" 2>/dev/null
+    [ -n "${MANIFEST:-}" ] && echo -e " --> Backups + change log: ${MANIFEST}" | tee -a "$LOGFILE" 2>/dev/null
+    echo -e " --> Restore any FILE entries listed there to roll back manually." | tee -a "$LOGFILE" 2>/dev/null
+    echo -e -n "${nocolor}"
+    exit 130
 }
 
 ############################################
@@ -875,17 +894,17 @@ function install_admin_key() {
     akfile="$home/.ssh/authorized_keys"
 
     step_begin "install_admin_key"
-    install -d -m 700 -o "$target" -g "$target" "$home/.ssh"
+    install -d -m 700 -o "$target" -g "$target" "$home/.ssh" || { fail_step; return 1; }
     change_record "$akfile"
-    touch "$akfile"
+    touch "$akfile" || { fail_step; return 1; }
     # Append only if not already present (dedupe).
     if grep -qxF "$key" "$akfile" 2>/dev/null; then
         echo -e " --> Admin key already present for $target; no change made." | tee -a "$LOGFILE"
     else
-        printf '%s\n' "$key" >> "$akfile"
+        printf '%s\n' "$key" >> "$akfile" || { fail_step; return 1; }
     fi
-    chown "$target":"$target" "$akfile"
-    chmod 600 "$akfile"
+    chown "$target":"$target" "$akfile" || { fail_step; return 1; }
+    chmod 600 "$akfile" || { fail_step; return 1; }
     step_commit
 
     echo -e -n "${lightgreen}"
@@ -936,9 +955,13 @@ function collect_sshd() {
             fi
         done
     fi
-    # Take a backup of the existing config (also record it in the backout manifest)
+    # Take a backup of the existing config (also record it in the backout manifest).
+    # SSHD_PRE_BACKUP is the known-good config used by restart_sshd to validate and
+    # restore before any restart, so a bad edit can never lock you out.
     step_begin "ssh_config"
     change_record "$SSHDFILE"
+    SSHD_PRE_BACKUP="${RUN_DIR:-/tmp}/sshd_config.pre.bak"
+    cp -a "$SSHDFILE" "$SSHD_PRE_BACKUP" 2>/dev/null
     BTIME=$(date +%F_%R)
     cat $SSHDFILE > $SSHDFILE."$BTIME".bak
     echo -e "\n"
@@ -1259,7 +1282,7 @@ function server_hardening() {
         elif grep -q "tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0" /etc/fstab; then :
         else
             change_record /etc/fstab
-            echo 'tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0' >> /etc/fstab
+            echo 'tmpfs /run/shm tmpfs defaults,noexec,nosuid 0 0' >> /etc/fstab || { fail_step; return; }
         fi
 
         # enable DDOS protection
@@ -1277,7 +1300,7 @@ function server_hardening() {
         elif skip_in_container "UFW DDOS before.rules"; then :
         else
             change_record /etc/ufw/before.rules
-            cat etc/ufw/before.rules > /etc/ufw/before.rules
+            cat etc/ufw/before.rules > /etc/ufw/before.rules || { fail_step; return; }
         fi
 
         # harden the networking layer
@@ -1293,7 +1316,7 @@ function server_hardening() {
         if skip_in_container "sysctl network hardening"; then :
         else
             change_record /etc/sysctl.conf
-            cat etc/sysctl.conf > /etc/sysctl.conf
+            cat etc/sysctl.conf > /etc/sysctl.conf || { fail_step; return; }
         fi
 
         # enable automatic security updates
@@ -1643,32 +1666,56 @@ function restart_sshd() {
     # check if SSHDRESTART is valid
     if [ "${SSHDRESTART,,}" = "Y" ] || [ "${SSHDRESTART,,}" = "y" ]
     then
-        # insert a pause or delay to add suspense
-        svc_restart sshd ssh
-        if [ "$FIREWALLP" = "yes" ] || [ "$FIREWALLP" = "y" ]
-        then ufw --force enable | tee -a "$LOGFILE"
-            echo -e " \n" | tee -a "$LOGFILE"
-        else :
-        fi
-        # Error Handling
-        if [ $? -eq 0 ]
-        then 	echo -e -n "${lightgreen}"
-            echo -e "------------------------------------------------------ " | tee -a "$LOGFILE"
-            echo " $(date +%m.%d.%Y_%H:%M:%S) : SUCCESS : SSHD restart complete" | tee -a "$LOGFILE"
-            echo -e "------------------------------------------------------ " | tee -a "$LOGFILE"
-            echo -e -n "${nocolor}"
-            if [ "$FIREWALLP" = "yes" ] || [ "$FIREWALLP" = "y" ]
-            echo -e -n "${lightgreen}"
-            then echo " $(date +%m.%d.%Y_%H:%M:%S) : SUCCESS : UFW firewall enabled" | tee -a "$LOGFILE"
-                echo -e "------------------------------------------------------ " | tee -a "$LOGFILE"
+        # LOCKOUT GUARD: validate the sshd config before restarting. If it is
+        # invalid, restore the known-good pre-change backup and re-validate; if it
+        # is STILL invalid, do NOT restart (leave the running sshd untouched).
+        local SSHD_BIN SSHD_OK=1
+        SSHD_BIN="$(command -v sshd || echo /usr/sbin/sshd)"
+        if [ -x "$SSHD_BIN" ]; then
+            if ! "$SSHD_BIN" -t 2>>"$LOGFILE"; then
+                echo -e -n "${lightred}"
+                echo -e " --> sshd config is INVALID; restoring pre-change backup to avoid lockout." | tee -a "$LOGFILE"
                 echo -e -n "${nocolor}"
-            else :
+                if [ -n "${SSHD_PRE_BACKUP:-}" ] && [ -e "$SSHD_PRE_BACKUP" ]; then
+                    cp -a "$SSHD_PRE_BACKUP" "$SSHDFILE"
+                fi
+                if "$SSHD_BIN" -t 2>>"$LOGFILE"; then
+                    echo -e "${lightgreen} --> Restored a valid sshd config.${nocolor}" | tee -a "$LOGFILE"
+                else
+                    SSHD_OK=0
+                    echo -e "${lightred} --> Still invalid after restore; NOT restarting sshd. Fix $SSHDFILE by hand.${nocolor}" | tee -a "$LOGFILE"
+                fi
             fi
         else
-            echo -e -n "${lightred}"
-            echo -e "------------------------------------------------------ " | tee -a "$LOGFILE"
-            echo " $(date +%m.%d.%Y_%H:%M:%S) : ERROR: SSHD could not restart" | tee -a "$LOGFILE"
-            echo -e "------------------------------------------------------ " | tee -a "$LOGFILE"
+            echo -e "${yellow} --> sshd binary not found; skipping config validation.${nocolor}" | tee -a "$LOGFILE"
+        fi
+
+        if [ "$SSHD_OK" = "1" ]; then
+            svc_restart sshd ssh
+            SSHD_RC=$?
+            if { [ "$FIREWALLP" = "yes" ] || [ "$FIREWALLP" = "y" ]; }; then
+                ufw --force enable | tee -a "$LOGFILE"
+                echo -e " \n" | tee -a "$LOGFILE"
+            fi
+            if [ "$SSHD_RC" -eq 0 ]; then
+                echo -e -n "${lightgreen}"
+                echo -e "------------------------------------------------------ " | tee -a "$LOGFILE"
+                echo " $(date +%m.%d.%Y_%H:%M:%S) : SUCCESS : SSHD restart complete" | tee -a "$LOGFILE"
+                echo -e "------------------------------------------------------ " | tee -a "$LOGFILE"
+                echo -e -n "${nocolor}"
+                if { [ "$FIREWALLP" = "yes" ] || [ "$FIREWALLP" = "y" ]; }; then
+                    echo -e -n "${lightgreen}"
+                    echo " $(date +%m.%d.%Y_%H:%M:%S) : SUCCESS : UFW firewall enabled" | tee -a "$LOGFILE"
+                    echo -e "------------------------------------------------------ " | tee -a "$LOGFILE"
+                    echo -e -n "${nocolor}"
+                fi
+            else
+                echo -e -n "${lightred}"
+                echo -e "------------------------------------------------------ " | tee -a "$LOGFILE"
+                echo " $(date +%m.%d.%Y_%H:%M:%S) : ERROR: SSHD could not restart" | tee -a "$LOGFILE"
+                echo -e "------------------------------------------------------ " | tee -a "$LOGFILE"
+                echo -e -n "${nocolor}"
+            fi
         fi
 
     else echo -e "\n"
